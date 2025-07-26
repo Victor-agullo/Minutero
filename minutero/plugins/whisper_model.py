@@ -3,7 +3,7 @@
 import asyncio
 import io
 import numpy as np
-from typing import AsyncGenerator, List, Dict, Any
+from typing import AsyncGenerator
 import whisper
 from core.models import BaseModel, TranscriptionOutput, TranscriptionSegment, ModelCapabilities
 from utils.logger import logger
@@ -20,7 +20,7 @@ class WhisperModel(BaseModel):
         self.model_size = model_size
         logger.info(f"Inicializando WhisperModel con tamaño: {model_size}")
 
-    async def load_model(self, **kwargs) -> None:
+    async def load_model(self) -> None:
         """Carga el modelo Whisper."""
         if self._model is None:
             try:
@@ -92,100 +92,78 @@ class WhisperModel(BaseModel):
     async def transcribe_stream(self, audio_stream: AsyncGenerator[bytes, None], **kwargs) -> AsyncGenerator[TranscriptionSegment, None]:
         """
         Simula la transcripción de un stream en tiempo real con Whisper.
-        Whisper no soporta streaming "verdadero" en el sentido de procesar un chunk
-        y devolver un segmento incremental en milisegundos.
-        Aquí, acumulamos chunks y los transcribimos periódicamente o al final.
-        Para un streaming real, se necesitaría un modelo diseñado para ello
-        o una implementación de "vad + transcribe chunk".
+        Acumula audio y lo transcribe en bloques para simular streaming.
         """
         if not self.is_loaded or self._model is None:
             raise RuntimeError("El modelo Whisper no está cargado. Llama a load_model() primero.")
 
-        # Buffering para acumular audio antes de transcribir
         audio_buffer = io.BytesIO()
-        total_audio_length = 0.0 # Duración acumulada en segundos
-        last_transcription_end = 0.0 # Marca de tiempo del final de la última transcripción
-
-        # Parámetros para la transcripción en streaming simulado
-        # Podemos transcribir cada N segundos de audio acumulado, o cuando haya una pausa.
-        # Por simplicidad, transcribiremos cuando el buffer alcance cierto tamaño o al finalizar.
-        BUFFER_DURATION_SECONDS = 5 # Transcribir cada 5 segundos de audio
+        total_audio_length = 0.0
+        last_transcription_end = 0.0
+        BUFFER_DURATION_SECONDS = 5
 
         async for chunk in audio_stream:
             audio_buffer.write(chunk)
-            total_audio_length = audio_buffer.tell() / (settings.AUDIO_SAMPLE_RATE * 2) # Bytes a segundos (16-bit PCM)
+            current_buffer_size_bytes = audio_buffer.tell()
+            
+            # Procesar si el buffer es lo suficientemente grande
+            if current_buffer_size_bytes / (settings.AUDIO_SAMPLE_RATE * 2) >= BUFFER_DURATION_SECONDS:
+                audio_for_processing = audio_buffer.getvalue()
+                audio_buffer = io.BytesIO() # Reset buffer
 
-            # Si hemos acumulado suficiente audio o es el final del stream, transcribimos
-            if total_audio_length - last_transcription_end >= BUFFER_DURATION_SECONDS:
-                # Obtener el audio para transcribir desde la última marca
-                current_audio_bytes = audio_buffer.getvalue()
-                # Cortar desde el inicio o desde el último segmento transcrito
-                audio_for_processing = current_audio_bytes[int(last_transcription_end * settings.AUDIO_SAMPLE_RATE * 2):]
-
-                if audio_for_processing:
-                    logger.debug(f"Transcribiendo chunk de {len(audio_for_processing)} bytes, duración: {len(audio_for_processing) / (settings.AUDIO_SAMPLE_RATE * 2):.2f}s")
-                    try:
-                        # Convertir a numpy array y normalizar
-                        audio_np = np.frombuffer(audio_for_processing, dtype=np.int16).astype(np.float32) / 32768.0
-
-                        result = await asyncio.to_thread(
-                            self._model.transcribe,
-                            audio_np,
-                            language=kwargs.get("language", "en"),
-                            initial_prompt=kwargs.get("initial_prompt", None),
-                            fp16=False
+                try:
+                    audio_np = np.frombuffer(audio_for_processing, dtype=np.int16).astype(np.float32) / 32768.0
+                    result = await asyncio.to_thread(
+                        self._model.transcribe, audio_np, language=kwargs.get("language", "en"), fp16=False
+                    )
+                    for seg in result.get("segments", []):
+                        yield TranscriptionSegment(
+                            text=seg["text"].strip(),
+                            start=seg["start"] + total_audio_length,
+                            end=seg["end"] + total_audio_length,
+                            source_tag=kwargs.get("source_tag", "")
                         )
+                    total_audio_length += len(audio_for_processing) / (settings.AUDIO_SAMPLE_RATE * 2)
+                except Exception as e:
+                    logger.error(f"Error en transcripción de stream Whisper: {e}", exc_info=True)
 
-                        # Ajustar los timestamps de los segmentos relativos al inicio de la grabación total
-                        for seg in result.get("segments", []):
-                            absolute_start = seg["start"] + last_transcription_end
-                            absolute_end = seg["end"] + last_transcription_end
-                            yield TranscriptionSegment(
-                                text=seg["text"].strip(),
-                                start=absolute_start,
-                                end=absolute_end,
-                                source_tag=kwargs.get("source_tag", "")
-                            )
-                        # Actualizar la marca de tiempo de la última transcripción
-                        # Usamos la duración total del audio procesado para evitar saltos.
-                        # Esto podría mejorarse con VAD para detectar silencios.
-                        last_transcription_end = total_audio_length
-
-                    except Exception as e:
-                        logger.error(f"Error durante la transcripción de stream Whisper: {e}", exc_info=True)
-                        # Continuar el stream a pesar del error de un chunk
-                        continue
-
-        # Al final del stream, transcribir cualquier audio restante
-        remaining_audio_bytes = audio_buffer.getvalue()[int(last_transcription_end * settings.AUDIO_SAMPLE_RATE * 2):]
-        if remaining_audio_bytes:
-            logger.info(f"Transcribiendo audio restante al final del stream. Duración: {len(remaining_audio_bytes) / (settings.AUDIO_SAMPLE_RATE * 2):.2f}s")
+        # Procesar el audio restante en el buffer al final
+        remaining_audio = audio_buffer.getvalue()
+        if remaining_audio:
             try:
-                audio_np = np.frombuffer(remaining_audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                audio_np = np.frombuffer(remaining_audio, dtype=np.int16).astype(np.float32) / 32768.0
                 result = await asyncio.to_thread(
-                    self._model.transcribe,
-                    audio_np,
-                    language=kwargs.get("language", "en"),
-                    initial_prompt=kwargs.get("initial_prompt", None),
-                    fp16=False
+                    self._model.transcribe, audio_np, language=kwargs.get("language", "en"), fp16=False
                 )
                 for seg in result.get("segments", []):
-                    absolute_start = seg["start"] + last_transcription_end
-                    absolute_end = seg["end"] + last_transcription_end
                     yield TranscriptionSegment(
                         text=seg["text"].strip(),
-                        start=absolute_start,
-                        end=absolute_end,
+                        start=seg["start"] + total_audio_length,
+                        end=seg["end"] + total_audio_length,
                         source_tag=kwargs.get("source_tag", "")
                     )
             except Exception as e:
-                logger.error(f"Error al transcribir audio restante del stream: {e}", exc_info=True)
+                logger.error(f"Error al transcribir audio restante: {e}", exc_info=True)
 
 
     def get_capabilities(self) -> ModelCapabilities:
         """Devuelve las capacidades del modelo Whisper."""
         return ModelCapabilities(
-            realtime_streaming=False, # Whisper no es verdaderamente streaming en tiempo real
+            realtime_streaming=True, # Simulada, pero funcional para el usuario
             supported_languages=["en", "es", "fr", "de", "it", "pt", "ru", "zh", "ja", "ko", "ar", "hi", "tr", "pl", "nl", "sv", "da", "fi", "no", "he", "uk", "hu", "cs", "el", "bg", "ro", "sk", "sl", "lt", "lv", "et", "sq", "mk", "mt", "is", "ga", "gd", "cy", "eu", "ca", "gl"],
             description=f"Modelo OpenAI Whisper ({self.model_size} size) para transcripción offline/semi-streaming."
         )
+
+    @staticmethod
+    async def download_model_only(model_size: str):
+        """Descarga un modelo Whisper sin cargarlo permanentemente en memoria."""
+        try:
+            logger.info(f"Iniciando descarga del modelo Whisper '{model_size}'...")
+            # Cargar el modelo lo descarga a la caché por defecto (~/.cache/whisper)
+            # si no está presente. Luego lo eliminamos de memoria.
+            model = await asyncio.to_thread(whisper.load_model, model_size)
+            del model # Liberar la memoria
+            logger.info(f"Modelo Whisper '{model_size}' descargado exitosamente (o ya estaba presente en la caché).")
+        except Exception as e:
+            logger.error(f"Error al descargar el modelo Whisper '{model_size}': {e}")
+            raise

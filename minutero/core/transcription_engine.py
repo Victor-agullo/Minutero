@@ -6,7 +6,6 @@ from core.models import BaseModel, TranscriptionSegment
 from core.audio_manager import AudioManager
 from core.model_factory import ModelFactory, model_factory
 from utils.logger import logger
-from config.settings import settings
 
 class TranscriptionEngine:
     """
@@ -22,8 +21,9 @@ class TranscriptionEngine:
 
     async def load_transcription_model(self, model_name_key: str, **kwargs) -> None:
         """Carga un modelo de transcripción y lo establece como el modelo actual."""
-        if self.current_model and self.current_model.model_name == model_name_key and self.current_model.is_loaded:
-            logger.info(f"El modelo '{model_name_key}' ya está cargado y es el actual.")
+        # Se asegura de que se pase 'model_size' al instanciar WhisperModel
+        if self.current_model and self.current_model.model_name == f"{model_name_key}-{kwargs.get('model_size', 'base')}" and self.current_model.is_loaded:
+            logger.info(f"El modelo '{model_name_key}' con configuración {kwargs} ya está cargado y es el actual.")
             return
 
         if self.current_model:
@@ -31,8 +31,9 @@ class TranscriptionEngine:
             await self.current_model.unload_model()
             self.current_model = None
 
-        logger.info(f"Cargando modelo de transcripción: {model_name_key}")
+        logger.info(f"Cargando modelo de transcripción: {model_name_key} con configuración: {kwargs}")
         try:
+            # Aquí se pasan los kwargs directamente a get_model_instance
             self.current_model = self.model_factory.get_model_instance(model_name_key, **kwargs)
             await self.current_model.load_model()
             logger.info(f"Modelo '{model_name_key}' cargado y listo para usar.")
@@ -143,4 +144,4 @@ class TranscriptionEngine:
         return {tag: "active" for tag in self.transcription_tasks.keys()}
 
 # Instancia global del TranscriptionEngine
-transcription_engine = TranscriptionEngine(AudioManager, model_factory)
+transcription_engine = TranscriptionEngine(AudioManager(), model_factory) # Se pasa una instancia de AudioManager

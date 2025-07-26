@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Audio Transcriber Client</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background-color: #f4f4f4; color: #333; }
+        h1, h2 { color: #0056b3; }
+        .container { background-color: #fff; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); margin-bottom: 20px; }
+        button { background-color: #007bff; color: white; padding: 10px 15px; border: none; border-radius: 5px; cursor: pointer; font-size: 16px; margin-right: 10px; }
+        button:hover { background-color: #0056b3; }
+        button:disabled { background-color: #cccccc; cursor: not-allowed; }
+        input[type="text"], select { padding: 8px; border-radius: 4px; border: 1px solid #ddd; margin-right: 10px; }
+        .log-area, .transcription-area { background-color: #e9e9e9; padding: 15px; border-radius: 5px; margin-top: 10px; max-height: 300px; overflow-y: auto; white-space: pre-wrap; word-wrap: break-word; }
+        .status-message { margin-top: 10px; font-weight: bold; }
+        .error-message { color: red; }
+        .success-message { color: green; }
+    </style>
+</head>
+<body>
+    <h1>Cliente de Transcripción de Audio</h1>
+
+    <div class="container">
+        <h2>Gestión de Modelos</h2>
+        <label for="modelSelect">Modelo:</label>
+        <select id="modelSelect">
+            </select>
+        <label for="modelSizeInput">Tamaño (Whisper):</label>
+        <input type="text" id="modelSizeInput" value="base" placeholder="ej. tiny, base, small, medium, large">
+        <button id="loadModelBtn">Cargar Modelo</button>
+        <button id="downloadModelBtn">Descargar Modelo</button>
+        <p class="status-message" id="modelStatus"></p>
+        <h3>Capacidades del Modelo Actual</h3>
+        <pre class="log-area" id="modelCapabilities"></pre>
+    </div>
+
+    <div class="container">
+        <h2>Transcripción en Tiempo Real</h2>
+        <label for="sourceTagInput">Etiqueta de Fuente:</label>
+        <input type="text" id="sourceTagInput" value="mic_stream_1">
+        <label for="sourceTypeSelect">Tipo de Fuente:</label>
+        <select id="sourceTypeSelect">
+            <option value="microphone">Micrófono</option>
+            <option value="file">Archivo WAV</option>
+            <option value="screen">Simulación de Pantalla</option>
+        </select>
+        <label for="filePathInput">Ruta de Archivo (si es tipo Archivo):</label>
+        <input type="text" id="filePathInput" placeholder="/path/to/audio.wav">
+        <label for="languageInput">Idioma:</label>
+        <input type="text" id="languageInput" value="es" placeholder="ej. en, es">
+        <label for="promptInput">Prompt Inicial:</label>
+        <input type="text" id="promptInput" placeholder="ej. El orador habla sobre tecnología...">
+        <br><br>
+        <button id="startTranscriptionBtn">Iniciar Transcripción</button>
+        <button id="stopTranscriptionBtn" disabled>Detener Transcripción</button>
+        <p class="status-message" id="transcriptionStatus"></p>
+        <h3>Transcripción:</h3>
+        <div class="transcription-area" id="transcriptionOutput"></div>
+    </div>
+
+    <div class="container">
+        <h2>Logs y Mensajes</h2>
+        <div class="log-area" id="logOutput"></div>
+    </div>
+
+    <script>
+        const API_BASE_URL = "http://localhost:8000";
+        let websocket = null;
+        let transcriptionInterval = null;
+
+        const logOutput = document.getElementById('logOutput');
+        const modelSelect = document.getElementById('modelSelect');
+        const modelSizeInput = document.getElementById('modelSizeInput');
+        const loadModelBtn = document.getElementById('loadModelBtn');
+        const downloadModelBtn = document.getElementById('downloadModelBtn');
+        const modelStatus = document.getElementById('modelStatus');
+        const modelCapabilities = document.getElementById('modelCapabilities');
+
+        const sourceTagInput = document.getElementById('sourceTagInput');
+        const sourceTypeSelect = document.getElementById('sourceTypeSelect');
+        const filePathInput = document.getElementById('filePathInput');
+        const languageInput = document.getElementById('languageInput');
+        const promptInput = document.getElementById('promptInput');
+        const startTranscriptionBtn = document.getElementById('startTranscriptionBtn');
+        const stopTranscriptionBtn = document.getElementById('stopTranscriptionBtn');
+        const transcriptionStatus = document.getElementById('transcriptionStatus');
+        const transcriptionOutput = document.getElementById('transcriptionOutput');
+
+        function appendLog(message, type = 'info') {
+            const p = document.createElement('p');
+            p.textContent = `[${new Date().toLocaleTimeString()}] ${message}`;
+            if (type === 'error') p.style.color = 'red';
+            if (type === 'success') p.style.color = 'green';
+            logOutput.appendChild(p);
+            logOutput.scrollTop = logOutput.scrollHeight; // Scroll to bottom
+        }
+
+        function setStatus(element, message, type = 'info') {
+            element.textContent = message;
+            element.className = `status-message ${type}-message`;
+        }
+
+        async function fetchAvailableModels() {
+            try {
+                const response = await fetch(`${API_BASE_URL}/models/available`);
+                const models = await response.json();
+                modelSelect.innerHTML = ''; // Clear existing options
+                models.forEach(model => {
+                    const option = document.createElement('option');
+                    option.value = model;
+                    option.textContent = model;
+                    modelSelect.appendChild(option);
+                });
+                appendLog("Modelos disponibles cargados.");
+            } catch (error) {
+                appendLog(`Error al cargar modelos disponibles: ${error.message}`, 'error');
+            }
+        }
+
+        async function fetchModelCapabilities(modelName) {
+            try {
+                const response = await fetch(`${API_BASE_URL}/models/capabilities/${modelName}`);
+                if (!response.ok) {
+                    throw new Error(`HTTP error! status: ${response.status}`);
+                }
+                const capabilities = await response.json();
+                modelCapabilities.textContent = JSON.stringify(capabilities, null, 2);
+                appendLog(`Capacidades del modelo ${modelName} cargadas.`);
+            } catch (error) {
+                modelCapabilities.textContent = `No se pudieron cargar las capacidades: ${error.message}`;
+                appendLog(`Error al cargar capacidades del modelo ${modelName}: ${error.message}`, 'error');
+            }
+        }
+
+        // Event Listeners
+        loadModelBtn.addEventListener('click', async () => {
+            const modelName = modelSelect.value;
+            const modelSize = modelSizeInput.value;
+            setStatus(modelStatus, `Cargando modelo ${modelName}...`);
+            try {
+                const response = await fetch(`${API_BASE_URL}/models/load`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({
+                        model_name: modelName,
+                        model_config_kwargs: { model_size: modelSize } // Pasa el tamaño del modelo
+                    })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    setStatus(modelStatus, result.message, 'success');
+                    appendLog(result.message, 'success');
+                    fetchModelCapabilities(modelName); // Actualizar capacidades una vez cargado
+                } else {
+                    setStatus(modelStatus, `Error: ${result.detail}`, 'error');
+                    appendLog(`Error al cargar modelo: ${result.detail}`, 'error');
+                }
+            } catch (error) {
+                setStatus(modelStatus, `Error de conexión: ${error.message}`, 'error');
+                appendLog(`Error de conexión al cargar modelo: ${error.message}`, 'error');
+            }
+        });
+
+        downloadModelBtn.addEventListener('click', async () => {
+            const modelSize = modelSizeInput.value;
+            setStatus(modelStatus, `Descargando modelo Whisper ${modelSize}...`);
+            try {
+                const response = await fetch(`${API_BASE_URL}/models/download`, {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ model_size: modelSize })
+                });
+                const result = await response.json();
+                if (response.ok) {
+                    setStatus(modelStatus, result.message, 'success');
+                    appendLog(result.message, 'success');
+                } else {
+                    setStatus(modelStatus, `Error: ${result.detail}`, 'error');
+                    appendLog(`Error al descargar modelo: ${result.detail}`, 'error');
+                }
+            } catch (error) {
+                setStatus(modelStatus, `Error de conexión: ${error.message}`, 'error');
+                appendLog(`Error de conexión al descargar modelo: ${error.message}`, 'error');
+            }
+        });
+
+
+        startTranscriptionBtn.addEventListener('click', async () => {
+            const sourceTag = sourceTagInput.value;
+            const sourceType = sourceTypeSelect.value;
+            const filePath = filePathInput.value;
+            const language = languageInput.value;
+            const initialPrompt = promptInput.value;
+
+            if (!sourceTag) {
+                alert("Por favor, introduce una etiqueta de fuente.");
+                return;
+            }
+
+            // Cerrar conexión anterior si existe
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                websocket.close();
+            }
+
+            // Establecer conexión WebSocket
+            websocket = new WebSocket(`${API_BASE_URL.replace('http', 'ws')}/transcribe/ws/${sourceTag}?language=${language}&initial_prompt=${encodeURIComponent(initialPrompt || '')}`);
+
+            websocket.onopen = async (event) => {
+                appendLog(`Conectado al WebSocket para ${sourceTag}. Enviando configuración inicial...`, 'success');
+                setStatus(transcriptionStatus, `Conectado al WebSocket.`, 'info');
+                startTranscriptionBtn.disabled = true;
+                stopTranscriptionBtn.disabled = false;
+
+                const startMessage = {
+                    action: "start",
+                    source_type: sourceType,
+                    source_tag: sourceTag,
+                    language: language,
+                    initial_prompt: initialPrompt
+                };
+                if (sourceType === "file") {
+                    startMessage.file_path = filePath;
+                }
+                await websocket.send(JSON.stringify(startMessage));
+                appendLog("Mensaje de inicio de transcripción enviado.", 'info');
+            };
+
+            websocket.onmessage = (event) => {
+                const data = JSON.parse(event.data);
+                if (data.status) {
+                    setStatus(transcriptionStatus, data.message, data.status === "started" ? "success" : "info");
+                    appendLog(`Status del backend: ${data.message}`, 'info');
+                } else if (data.text) {
+                    transcriptionOutput.textContent += `${data.text} `;
+                    transcriptionOutput.scrollTop = transcriptionOutput.scrollHeight;
+                }
+            };
+
+            websocket.onerror = (event) => {
+                appendLog(`Error en WebSocket: ${event.message || "Error desconocido"}`, 'error');
+                setStatus(transcriptionStatus, "Error en la conexión WebSocket.", 'error');
+                stopTranscription(); // Asegurarse de limpiar el estado
+            };
+
+            websocket.onclose = (event) => {
+                appendLog(`WebSocket cerrado para ${sourceTag}. Código: ${event.code}, Razón: ${event.reason}`, 'info');
+                setStatus(transcriptionStatus, `WebSocket desconectado.`, 'info');
+                stopTranscription(); // Limpiar el estado del UI
+            };
+        });
+
+        stopTranscriptionBtn.addEventListener('click', () => {
+            if (websocket && websocket.readyState === WebSocket.OPEN) {
+                appendLog(`Enviando solicitud de detención para ${sourceTagInput.value}...`, 'info');
+                // Enviar mensaje de stop para que el backend detenga la tarea
+                websocket.send(JSON.stringify({ action: "stop" }));
+                // Opcional: Cierra el websocket desde el cliente también
+                websocket.close();
+            } else {
+                appendLog("No hay conexión WebSocket activa para detener.", 'warning');
+                stopTranscription(); // Forzar limpieza de UI
+            }
+        });
+
+        function stopTranscription() {
+            startTranscriptionBtn.disabled = false;
+            stopTranscriptionBtn.disabled = true;
+            transcriptionOutput.textContent = ''; // Limpiar salida de transcripción
+            setStatus(transcriptionStatus, 'Transcripción detenida.', 'info');
+            if (websocket) {
+                websocket = null;
+            }
+        }
+
+        // Initial fetch of available models when page loads
+        document.addEventListener('DOMContentLoaded', () => {
+            fetchAvailableModels();
+            // Fetch capabilities for the default selected model initially
+            fetchModelCapabilities(modelSelect.value);
+
+            // Add event listener for model selection change to update capabilities
+            modelSelect.addEventListener('change', (event) => {
+                fetchModelCapabilities(event.target.value);
+            });
+        });
+
+    </script>
+</body>
+</html>

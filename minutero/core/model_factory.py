@@ -42,7 +42,8 @@ class ModelFactory:
                     for attr_name in dir(module):
                         attr = getattr(module, attr_name)
                         if isinstance(attr, type) and issubclass(attr, BaseModel) and attr is not BaseModel:
-                            self.register_model(module_name, attr)
+                            # Usar el nombre de la clase como clave de registro
+                            self.register_model(attr.__name__, attr)
                             logger.info(f"Modelo '{attr.__name__}' registrado para el plugin '{module_name}'.")
 
                 except Exception as e:
@@ -60,11 +61,20 @@ class ModelFactory:
     def get_model_instance(self, model_name_key: str, **kwargs) -> BaseModel:
         """
         Crea una instancia de un modelo de transcripción registrado.
-        model_name_key: El nombre clave del modelo (ej: 'whisper_model').
+        model_name_key: El nombre clave del modelo (ej: 'WhisperModel').
         """
         model_class = self._registered_models.get(model_name_key)
         if not model_class:
-            raise ValueError(f"Modelo '{model_name_key}' no encontrado. Modelos disponibles: {list(self._registered_models.keys())}")
+            # Buscar por el alias si el nombre exacto no se encuentra (ej. 'whisper' -> 'WhisperModel')
+            for name, cls in self._registered_models.items():
+                if name.lower().startswith(model_name_key.lower()): # Permite buscar "whisper" para "WhisperModel"
+                    model_class = cls
+                    logger.info(f"Resolviendo '{model_name_key}' a la clase de modelo '{name}'.")
+                    break
+            if not model_class:
+                raise ValueError(f"Modelo '{model_name_key}' no encontrado. Modelos disponibles: {list(self._registered_models.keys())}")
+        
+        # Pasa todos los kwargs a la inicialización de la clase del modelo
         return model_class(**kwargs)
 
     def get_available_models(self) -> list[str]:

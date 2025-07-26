@@ -4,14 +4,18 @@ import asyncio
 from contextlib import asynccontextmanager
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depends
 from fastapi.responses import HTMLResponse
-from typing import Dict, Callable, Any, List, Optional, Literal
-from pydantic import BaseModel as PydanticBaseModel # Renombrar para evitar conflicto
+from typing import Dict, Any, List, Optional, Literal
+from pydantic import BaseModel as PydanticBaseModel
+from fastapi.middleware.cors import CORSMiddleware # <--- Añadir esta importación
 
 from core.models import TranscriptionSegment, ModelCapabilities
 from core.transcription_engine import transcription_engine
 from core.model_factory import model_factory
 from utils.logger import logger
 from config.settings import settings
+
+# Importar WhisperModel para acceder a su método estático
+from plugins.whisper_model import WhisperModel
 
 # --- Lifespan Event Handler ---
 
@@ -54,6 +58,16 @@ app = FastAPI(
     lifespan=lifespan # Registrar el nuevo manejador de eventos
 )
 
+# <--- Añadir la configuración del middleware CORS aquí --->
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permite todos los orígenes. En producción, especifica tus dominios.
+    allow_credentials=True,
+    allow_methods=["*"],  # Permite todos los métodos (GET, POST, PUT, DELETE, OPTIONS, etc.)
+    allow_headers=["*"],  # Permite todas las cabeceras
+)
+# <--- Fin de la configuración del middleware CORS --->
+
 # --- Dependencias (opcional, pero buena práctica para inyección) ---
 def get_transcription_engine():
     return transcription_engine
@@ -65,7 +79,10 @@ def get_model_factory():
 
 class LoadModelRequest(PydanticBaseModel):
     model_name: str = settings.DEFAULT_MODEL # Por defecto a Whisper
-    model_config_kwargs: Dict[str, Any] = {}
+    model_config_kwargs: Dict[str, Any] = {} # Para pasar 'model_size' a WhisperModel
+
+class DownloadModelRequest(PydanticBaseModel):
+    model_size: str = "base" # Tamaño del modelo Whisper a descargar
 
 class StartTranscriptionRequest(PydanticBaseModel):
     source_type: Literal["microphone", "file", "screen"]
@@ -85,6 +102,7 @@ async def read_root():
     <p>Usa los endpoints de API para interactuar:</p>
     <ul>
         <li><code>/models/load</code> (POST) para cargar un modelo.</li>
+        <li><code>/models/download</code> (POST) para descargar un modelo.</li>
         <li><code>/models/available</code> (GET) para ver modelos disponibles.</li>
         <li><code>/models/capabilities/{model_name}</code> (GET) para ver capacidades de un modelo.</li>
         <li><code>/transcribe/ws/{source_tag}</code> (WebSocket) para iniciar y recibir transcripciones en tiempo real.</li>
@@ -106,11 +124,29 @@ async def load_model(
     Solo un modelo puede estar cargado a la vez. Si ya hay uno cargado, se descargará primero.
     """
     try:
+        # Pasa model_config_kwargs a load_transcription_model
+        # Esto permite que el WhisperModel reciba "model_size" al instanciarse
         await engine.load_transcription_model(request.model_name, **request.model_config_kwargs)
         return {"message": f"Modelo '{request.model_name}' cargado exitosamente."}
     except Exception as e:
         logger.error(f"Error al cargar el modelo '{request.model_name}': {e}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Fallo al cargar el modelo: {e}")
+
+@app.post("/models/download", summary="Descargar un modelo de Whisper")
+async def download_whisper_model(
+    request: DownloadModelRequest
+):
+    """
+    Descarga un modelo de Whisper específico (ej. "base", "medium", "large") a la caché local.
+    Esto no carga el modelo en memoria.
+    """
+    try:
+        await WhisperModel.download_model_only(request.model_size)
+        return {"message": f"Modelo Whisper '{request.model_size}' descargado exitosamente (o ya estaba en caché)."}
+    except Exception as e:
+        logger.error(f"Error al descargar el modelo Whisper '{request.model_size}': {e}", exc_info=True)
+        raise HTTPException(status_code=500, detail=f"Fallo al descargar el modelo: {e}")
+
 
 @app.get("/models/available", response_model=List[str], summary="Obtener modelos de transcripción disponibles")
 async def get_available_models(
@@ -274,4 +310,6 @@ async def websocket_transcribe(
 # --- Función para iniciar el servidor (opcional) ---
 if __name__ == "__main__":
     import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    # Se añade la opción loop="asyncio" y ws="websockets" para compatibilidad y rendimiento
+    # En versiones recientes de Uvicorn, esto puede ser inferido, pero es explícito.
+    uvicorn.run(app, host="0.0.0.0", port=8000, loop="asyncio", ws="websockets")
