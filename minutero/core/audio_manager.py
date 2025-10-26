@@ -1,7 +1,10 @@
 import asyncio
 import wave
 import os
+import sys
 import ctypes
+import threading
+import numpy as np
 from concurrent.futures import ThreadPoolExecutor
 from typing import AsyncGenerator, Literal, Dict
 
@@ -19,11 +22,10 @@ class AudioManager:
     """
 
     def __init__(self):
-        self.active_streams: Dict[str, asyncio.Task] = {}
+        self.active_streams: Dict[str, tuple[asyncio.Task, threading.Event | None]] = {}
         logger.info("AudioManager inicializado.")
 
     async def _microphone_stream_generator(self, source_tag: str) -> AsyncGenerator[bytes, None]:
-        """Generador asíncrono para capturar audio del micrófono."""
         try:
             device_info = sd.query_devices(kind='input')
             device_id = device_info['index']
@@ -36,7 +38,12 @@ class AudioManager:
             def callback(indata, frames, time, status):
                 if status:
                     logger.warning(f"Status del stream de micrófono: {status}")
-                loop.call_soon_threadsafe(q.put_nowait, bytes(indata))
+                # Convertir a int16 si no lo está ya
+                if indata.dtype != np.int16:
+                    audio_data = (indata * 32767).astype(np.int16)
+                else:
+                    audio_data = indata
+                loop.call_soon_threadsafe(q.put_nowait, audio_data.tobytes())
                 loop.call_soon_threadsafe(event.set)
 
             with sd.InputStream(
@@ -69,7 +76,6 @@ class AudioManager:
             logger.info(f"Stream de micrófono para {source_tag} finalizado.")
 
     async def _file_stream_generator(self, file_path: str, source_tag: str) -> AsyncGenerator[bytes, None]:
-        """Generador asíncrono para leer audio de un archivo WAV."""
         if not os.path.exists(file_path):
             logger.error(f"Archivo de audio no encontrado: {file_path}")
             raise FileNotFoundError(f"Archivo de audio no encontrado: {file_path}")
@@ -101,50 +107,140 @@ class AudioManager:
     async def _screen_capture_stream_generator(self, source_tag: str) -> AsyncGenerator[bytes, None]:
         """
         Captura audio de la salida del sistema (loopback) usando SoundCard.
-        Requiere que exista un micrófono virtual de loopback asociado al altavoz por defecto.
-        Actualmente probado en Windows (WASAPI-loopback) con inicialización COM.
+        Versión mejorada con mejor detección de dispositivos y manejo de datos.
         """
         loop = asyncio.get_running_loop()
         q: asyncio.Queue[bytes] = asyncio.Queue()
+        stop_event = threading.Event()
 
-        def _record_loopback(queue: asyncio.Queue, event_loop: asyncio.AbstractEventLoop):
-            # Inicializar COM en este hilo (MTA)
-            ctypes.windll.ole32.CoInitializeEx(None, 0)
+        def _record_loopback(queue: asyncio.Queue, event_loop: asyncio.AbstractEventLoop, stop_event: threading.Event):
+            if sys.platform == "win32":
+                ctypes.windll.ole32.CoInitializeEx(None, 0)
+            
+            loopback_mic = None
             try:
-                # Obtiene el micrófono loopback asociado al altavoz por defecto
-                default_speaker = sc.default_speaker()
-                loopback_mic = sc.get_microphone(
-                    id=default_speaker.name,
-                    include_loopback=True
-                )
-                logger.info(f"Iniciando loopback de sistema: {loopback_mic.name}")
+                # Método 1: Intentar obtener el loopback del altavoz por defecto
+                try:
+                    default_speaker = sc.default_speaker()
+                    logger.info(f"Altavoz por defecto: '{default_speaker.name}' (ID: {default_speaker.id})")
+                    
+                    # Buscar el loopback correspondiente al altavoz por defecto
+                    all_mics = sc.all_microphones(include_loopback=True)
+                    for mic in all_mics:
+                        if mic.isloopback and mic.id == default_speaker.id:
+                            loopback_mic = mic
+                            logger.info(f"Loopback del altavoz por defecto encontrado: '{loopback_mic.name}'")
+                            break
+                            
+                except Exception as e:
+                    logger.warning(f"Error al buscar loopback del altavoz por defecto: {e}")
 
+                # Método 2: Si no se encuentra, buscar cualquier loopback activo
+                if not loopback_mic:
+                    logger.info("Buscando cualquier dispositivo de loopback disponible...")
+                    try:
+                        all_mics = sc.all_microphones(include_loopback=True)
+                        logger.info(f"Dispositivos de audio encontrados: {len(all_mics)}")
+                        
+                        for i, mic in enumerate(all_mics):
+                            logger.info(f"  {i}: '{mic.name}' - Loopback: {mic.isloopback}")
+                            if mic.isloopback:
+                                loopback_mic = mic
+                                logger.info(f"Usando dispositivo de loopback: '{loopback_mic.name}'")
+                                break
+                    except Exception as e:
+                        logger.error(f"Error al listar dispositivos de audio: {e}")
+
+                if not loopback_mic:
+                    msg = "No se encontró ningún dispositivo de loopback. Verifica que el audio del sistema esté activo."
+                    logger.error(msg)
+                    event_loop.call_soon_threadsafe(queue.put_nowait, RuntimeError(msg))
+                    return
+
+                logger.info(f"Iniciando grabación con: '{loopback_mic.name}' (SR: {settings.AUDIO_SAMPLE_RATE}, Chunk: {settings.AUDIO_CHUNK_SIZE})")
+                
+                # Buffer para acumular datos y garantizar chunks consistentes
+                audio_buffer = np.array([], dtype=np.float32)
+                target_chunk_size = settings.AUDIO_CHUNK_SIZE
+                
                 with loopback_mic.recorder(
                     samplerate=settings.AUDIO_SAMPLE_RATE,
-                    channels=loopback_mic.channels
+                    channels=1
                 ) as recorder:
-                    while True:
-                        frames = recorder.record(numframes=settings.AUDIO_CHUNK_SIZE)
-                        event_loop.call_soon_threadsafe(queue.put_nowait, frames.tobytes())
-            except Exception as e:
-                logger.error(f"Error en loopback thread: {e}", exc_info=True)
-            finally:
-                ctypes.windll.ole32.CoUninitialize()
+                    while not stop_event.is_set():
+                        try:
+                            # Grabar un chunk pequeño
+                            data = recorder.record(numframes=target_chunk_size // 4)
+                            
+                            if data is not None and len(data) > 0:
+                                # Normalizar forma de datos
+                                if data.ndim == 2:
+                                    data = data.flatten()
+                                
+                                # Convertir a float32 y normalizar
+                                if data.dtype != np.float32:
+                                    data = data.astype(np.float32)
+                                
+                                # Agregar al buffer
+                                audio_buffer = np.concatenate([audio_buffer, data])
+                                
+                                # Enviar chunks completos del buffer
+                                while len(audio_buffer) >= target_chunk_size:
+                                    chunk = audio_buffer[:target_chunk_size]
+                                    audio_buffer = audio_buffer[target_chunk_size:]
+                                    
+                                    # Convertir a int16 PCM
+                                    chunk = np.clip(chunk, -1.0, 1.0)
+                                    audio_data = (chunk * 32767).astype(np.int16)
+                                    
+                                    # Verificar audio válido
+                                    if np.max(np.abs(audio_data)) > 50:
+                                        logger.debug(f"Enviando chunk de audio: {len(audio_data)} muestras")
+                                    
+                                    if not stop_event.is_set():
+                                        event_loop.call_soon_threadsafe(queue.put_nowait, audio_data.tobytes())
+                            
+                        except Exception as e:
+                            logger.error(f"Error al grabar chunk de audio: {e}")
+                            if not stop_event.is_set():
+                                event_loop.call_soon_threadsafe(queue.put_nowait, e)
+                            break
 
-        # Arrancar el hilo de grabación
+            except Exception as e:
+                logger.error(f"Error en el hilo de grabación de loopback: {e}", exc_info=True)
+                event_loop.call_soon_threadsafe(queue.put_nowait, e)
+            finally:
+                if sys.platform == "win32":
+                    ctypes.windll.ole32.CoUninitialize()
+                logger.info(f"Hilo de grabación de loopback para '{source_tag}' finalizado.")
+
         executor = ThreadPoolExecutor(max_workers=1)
-        record_task = loop.run_in_executor(executor, _record_loopback, q, loop)
-        self.active_streams[source_tag] = record_task
+        record_task = loop.run_in_executor(executor, _record_loopback, q, loop, stop_event)
+        self.active_streams[source_tag] = (record_task, stop_event)
 
         try:
+            chunk_count = 0
             while True:
                 chunk = await q.get()
+                if isinstance(chunk, Exception):
+                    raise chunk
+                
+                chunk_count += 1
+                if chunk_count % 100 == 0:  # Log cada 100 chunks para debugging
+                    logger.debug(f"Procesados {chunk_count} chunks de audio del sistema")
+                
                 yield chunk
+                
         except asyncio.CancelledError:
             logger.info(f"Stream de loopback '{source_tag}' cancelado por petición.")
         finally:
-            executor.shutdown(wait=False)
-            logger.info(f"Stream de loopback para {source_tag} finalizado.")
+            stop_event.set()
+            if record_task and not record_task.done():
+                await asyncio.sleep(0.1)
+            executor.shutdown(wait=True)
+            if source_tag in self.active_streams:
+                del self.active_streams[source_tag]
+            logger.info(f"Stream de loopback para {source_tag} completamente finalizado.")
 
     async def start_stream(
         self,
@@ -152,44 +248,40 @@ class AudioManager:
         source_tag: str,
         **kwargs
     ) -> AsyncGenerator[bytes, None]:
-        """
-        Inicia un stream de audio para una fuente específica.
-        Args:
-            source_type: "microphone", "file" o "screen"
-            source_tag: Etiqueta única para este stream
-            **kwargs: Parámetros extra (p.ej. file_path para "file")
-        """
         if source_tag in self.active_streams:
             logger.warning(f"El stream con la etiqueta '{source_tag}' ya está activo.")
             return
-
+        
         if source_type == "microphone":
-            generator = self._microphone_stream_generator(source_tag)
+            return self._microphone_stream_generator(source_tag)
         elif source_type == "file":
-            file_path = kwargs.get("file_path")
+            file_path = kwargs.get("file_path", "")
             if not file_path:
                 raise ValueError("Se requiere 'file_path' para fuente 'file'.")
-            generator = self._file_stream_generator(file_path, source_tag)
+            return self._file_stream_generator(file_path, source_tag)
         elif source_type == "screen":
-            generator = self._screen_capture_stream_generator(source_tag)
+            return self._screen_capture_stream_generator(source_tag)
         else:
             raise ValueError(f"Tipo de fuente no soportado: {source_type}")
 
-        return generator
-
-    def stop_stream(self, source_tag: str):
-        """Detiene un stream de audio activo."""
+    async def stop_stream(self, source_tag: str):
         if source_tag in self.active_streams:
-            task = self.active_streams.pop(source_tag)
-            task.cancel()
-            logger.info(f"Stream de audio '{source_tag}' cancelado.")
+            task, stop_event = self.active_streams.pop(source_tag)
+            
+            if stop_event:
+                stop_event.set()
+            
+            if not task.done():
+                task.cancel()
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    pass
+            logger.info(f"Se ha solicitado la detención del stream de audio '{source_tag}'.")
         else:
-            logger.warning(f"No existe stream activo con etiqueta '{source_tag}'.")
+            logger.warning(f"No se encontró un stream activo con etiqueta '{source_tag}' para detener.")
 
     def get_active_streams(self) -> list[str]:
-        """Devuelve una lista de las etiquetas de los streams activos."""
         return list(self.active_streams.keys())
 
-
-# Instancia global
 audio_manager = AudioManager()

@@ -6,7 +6,7 @@ from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException, Depe
 from fastapi.responses import HTMLResponse
 from typing import Dict, Any, List, Optional, Literal
 from pydantic import BaseModel as PydanticBaseModel
-from fastapi.middleware.cors import CORSMiddleware # <--- Añadir esta importación
+from fastapi.middleware.cors import CORSMiddleware
 
 from core.models import TranscriptionSegment, ModelCapabilities
 from core.transcription_engine import transcription_engine
