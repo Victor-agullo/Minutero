@@ -1,4 +1,4 @@
-# Minutador de Transcripción Multicanal (Rust + Whisper)
+# Minutador de Transcripción Multicanal
 
 ![Rust](https://img.shields.io/badge/Made_with-Rust-orange?style=flat-square)
 ![Whisper](https://img.shields.io/badge/Model-OpenAI_Whisper-blueviolet?style=flat-square)
