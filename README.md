@@ -1,183 +1,103 @@
-# Transcriptor de Audio con Whisper
+# Minutador de Transcripción Multicanal (Rust + Whisper)
 
-Una aplicación GUI para transcribir audio en tiempo real usando el modelo Whisper de OpenAI.
+![Rust](https://img.shields.io/badge/Made_with-Rust-orange?style=flat-square)
+![Whisper](https://img.shields.io/badge/Model-OpenAI_Whisper-blueviolet?style=flat-square)
+![Status](https://img.shields.io/badge/Status-Experimental-yellow?style=flat-square)
 
-## Características
+Una aplicación de escritorio escrita en Rust para transcribir audio en tiempo real utilizando el modelo **Whisper** de OpenAI de forma local. Diseñada para generar minutas de reuniones, permite capturar simultáneamente micrófonos y audio del sistema (loopback), identificando a diferentes interlocutores.
 
-- 🎤 **Captura de micrófono**: Transcribe audio del micrófono en tiempo real
-- 🖥️ **Captura de escritorio**: Captura audio del sistema (música, videos, etc.)
-- 📁 **Archivos de audio**: Procesa archivos de audio pregrabados
-- 🏷️ **Nombres personalizables**: Asigna nombres custom a cada fuente de audio
-- 📝 **Exportación Markdown**: Guarda transcripciones con timestamps
-- 🎯 **Detección de actividad vocal**: Solo transcribe cuando detecta voz
-- 🌍 **Múltiples idiomas**: Soporta español, inglés y muchos otros idiomas
+## ⚠️ Estado del Soporte Multiplataforma
 
-## Requisitos
+**Por favor, lee esto antes de usar:**
 
-- Rust 1.70+
-- CUDA (opcional, para aceleración GPU)
-- Metal (opcional, para aceleración en macOS)
+Este proyecto ha sido desarrollado y probado principalmente en **Linux** (bajo entornos PulseAudio y PipeWire).
 
-## Instalación
+* **🐧 Linux:** Soporte completo. Requiere herramientas estándar de audio (`pactl`, `parecord`).
+* **🪟 Windows:** El código incluye lógica para detectar "Mezcla Estéreo" (Stereo Mix) vía PowerShell y usar WASAPI vía `cpal`, pero **no ha sido probado exhaustivamente**.
+* **🍎 macOS:** Se incluye lógica básica, pero **no ha sido probado**. La captura de audio del sistema en macOS requiere software de terceros (como BlackHole) debido a limitaciones del sistema operativo.
 
-### 1. Clonar el repositorio
+> Se agradecen PRs (Pull Requests) y reportes de errores ("Issues") para mejorar la estabilidad en Windows y macOS.
 
-```bash
-git clone <tu-repositorio>
-cd whisper-transcriber
-```
+## ✨ Características
 
-### 2. Descargar modelo Whisper
+* **Transcripción Local:** Ejecuta modelos Whisper (`ggml`) localmente. Privacidad total, sin enviar audio a la nube.
+* **Multicanal / Multi-Interlocutor:**
+    * Captura tu micrófono (Entrada).
+    * Captura lo que escuchas en la reunión (Salida/Loopback).
+    * Asigna nombres a cada fuente para generar un guion tipo chat.
+* **Detección de Silencio (VAD):** Filtra los silencios para evitar alucinaciones del modelo y procesar solo cuando se habla.
+* **Interfaz Gráfica (GUI):** Construida con `egui` para una experiencia ligera y rápida.
+* **Gestión Automática de Modelos:** Descarga automáticamente los modelos necesarios (`base`, `medium`, `large-v3`) desde HuggingFace.
+* **Exportación:** Guarda las transcripciones automáticamente en formato Markdown con fecha y hora.
 
-Descarga uno de estos modelos y colócalo en el directorio del proyecto:
+## 🛠️ Prerrequisitos
 
-**Modelos GGML (recomendado para CPU):**
-- `ggml-base.bin` (140MB) - Buena calidad, velocidad moderada
-- `ggml-small.bin` (460MB) - Mejor calidad, más lento
-- `ggml-medium.bin` (1.4GB) - Excelente calidad, lento
+Necesitas tener instalado [Rust y Cargo](https://rustup.rs/).
 
-**Descargar desde:**
-```bash
-# Modelo base (recomendado)
-wget https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+### Dependencias del Sistema (Linux)
 
-# O usar curl
-curl -L -o ggml-base.bin https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
-```
-
-**Modelos SafeTensors (para GPU):**
-- Descarga desde Hugging Face: `openai/whisper-base`
-
-### 3. Compilar la aplicación
+En sistemas basados en Debian/Ubuntu, necesitarás las librerías de desarrollo de ALSA y utilidades de audio:
 
 ```bash
-# Compilación básica (CPU)
-cargo build --release
+sudo apt update
+sudo apt install build-essential libasound2-dev pkg-config pulseaudio-utils
 
-# Con soporte CUDA (GPU NVIDIA)
-cargo build --release --features cuda
-
-# Con soporte Metal (macOS)
-cargo build --release --features metal
 ```
 
-### 4. Ejecutar
+*Nota: La aplicación utiliza `pactl` y `parecord` internamente para gestionar dispositivos en Linux de manera robusta.*
 
+## 🚀 Instalación y Ejecución
+
+1. **Clonar el repositorio:**
 ```bash
-./target/release/whisper-transcriber
-```
-
-## Uso
-
-### 1. Configurar fuentes de audio
-
-- **Micrófono**: Marca la casilla y selecciona tu micrófono
-- **Escritorio**: Marca la casilla para capturar audio del sistema
-- **Archivo**: Selecciona un archivo de audio para transcribir
-
-### 2. Personalizar nombres
-
-Edita los nombres que aparecerán en la transcripción para cada fuente.
-
-### 3. Iniciar transcripción
-
-- Presiona "🎯 Empezar a escuchar"
-- El modelo se cargará automáticamente
-- La transcripción comenzará en tiempo real
-
-### 4. Ver resultados
-
-- Las transcripciones se guardan automáticamente en `transcripcion.md`
-- Cada entrada incluye timestamp y fuente
-- Puedes cambiar el archivo de salida en la interfaz
-
-## Formatos de archivo soportados
-
-- **Audio**: WAV, MP3, M4A, FLAC, OGG
-- **Salida**: Markdown (.md)
-
-## Configuración avanzada
-
-### Filtros de audio
-
-El código incluye filtros opcionales:
-
-- **Filtro paso alto**: Elimina ruido de baja frecuencia
-- **Detección de actividad vocal**: Solo transcribe cuando detecta voz
-- **Resampleo**: Convierte automáticamente a 16kHz (requerido por Whisper)
-
-### Idiomas soportados
-
-- Español (es)
-- Inglés (en)
-- Francés (fr)
-- Alemán (de)
-- Italiano (it)
-- Portugués (pt)
-- Ruso (ru)
-- Japonés (ja)
-- Coreano (ko)
-- Chino (zh)
-
-## Solución de problemas
-
-### El modelo no se carga
-
-- Verifica que el archivo `ggml-base.bin` esté en el directorio del proyecto
-- Asegúrate de que el archivo no esté corrupto
-- Prueba con un modelo más pequeño si tienes poca RAM
-
-### Sin audio del micrófono
-
-- Verifica permisos de micrófono en tu sistema
-- Prueba con diferentes micrófonos de la lista
-- En Linux, asegúrate de que ALSA/PulseAudio estén configurados
-
-### Captura de escritorio no funciona
-
-- En Windows: Requiere permisos de administrador
-- En macOS: Habilita permisos de grabación de pantalla
-- En Linux: Configura PulseAudio monitor
-
-### Rendimiento lento
-
-- Usa modelos más pequeños (`ggml-tiny.bin`)
-- Habilita aceleración GPU si tienes CUDA/Metal
-- Reduce la frecuencia de procesamiento
-
-## Desarrollo
-
-### Estructura del proyecto
+git clone [https://github.com/Victor-agullo/Minutero](https://github.com/Victor-agullo/Minutero)
+cd minutador-whisper-rust
 
 ```
-src/
-├── main.rs              # Aplicación principal y GUI
-├── whisper_engine.rs    # Integración con Whisper
-├── audio_capture.rs     # Captura de audio
-└── lib.rs              # Módulos y exports
+
+
+2. **Compilar y Ejecutar:**
+```bash
+cargo run --release
+
 ```
 
-### Dependencias principales
 
-- `eframe/egui`: Interfaz gráfica
-- `candle-whisper`: Modelo Whisper
-- `cpal`: Captura de audio
-- `symphonia`: Decodificación de archivos de audio
+*Se recomienda usar `--release` para que la inferencia del modelo Whisper sea rápida y en tiempo real.*
 
-### Contribuir
+## 📖 Guía de Uso
 
-1. Fork el repositorio
-2. Crea una rama para tu feature
-3. Commit tus cambios
-4. Push a la rama
-5. Crea un Pull Request
+1. **Inicio:** Al abrir la app, verás la pestaña de "Transcripción".
+2. **Configuración:** Ve a la pestaña **⚙️ Configuración**.
+* **Añadir Fuente:** Pulsa "➕ Entrada" para micrófonos o "➕ Salida" para el audio del sistema.
+* **Loopback (Audio del sistema):** Si estás en Linux, detectará los monitores automáticamente. En Windows, asegúrate de tener habilitada la "Mezcla Estéreo".
+* **Activar:** Marca la casilla (checkbox) de los perfiles que quieras grabar.
 
-## Licencia
 
-MIT License - ve el archivo LICENSE para detalles.
+3. **Modelo:** En la pantalla principal, selecciona el modelo (ej. `medium` o `large-v3`). La primera vez que inicies la captura, el programa descargará el modelo (puede tardar unos minutos dependiendo de tu conexión).
+4. **Transcribir:** Pulsa **▶ Iniciar Captura**.
+5. **Resultados:** El texto aparecerá en tiempo real. Al finalizar, la minuta se guardará en la carpeta `minutas/`.
 
-## Créditos
+## 📂 Estructura del Proyecto
 
-- OpenAI por el modelo Whisper
-- Candle por la implementación en Rust
-- Comunidad de egui por la GUI
+* `main.rs`: Punto de entrada y configuración de la ventana.
+* `ui.rs`: Lógica de la interfaz gráfica (`egui`), gestión de estado y renderizado.
+* `audio.rs`: Núcleo de la captura de audio y procesamiento con Whisper. Gestiona hilos y conversión de audio.
+* `system_audio.rs`: Utilidades para detectar capacidades de loopback/monitor según el sistema operativo.
+* `data.rs`: Estructuras de datos compartidas (perfiles, mensajes, enums).
+
+## 🤝 Contribuciones
+
+Las contribuciones son bienvenidas, especialmente para mejorar la capa de abstracción de audio (`cpal`) en Windows y macOS para reducir la dependencia de comandos externos de Linux.
+
+1. Haz un Fork del proyecto.
+2. Crea tu rama de funcionalidad (`git checkout -b feature/AmazingFeature`).
+3. Haz Commit de tus cambios (`git commit -m 'Add some AmazingFeature'`).
+4. Push a la rama (`git push origin feature/AmazingFeature`).
+5. Abre un Pull Request.
+
+## 📄 Licencia
+
+Este proyecto está bajo la licencia MIT. Consulta el archivo `LICENSE` para más detalles.
+
+**Nota:** Este software utiliza `whisper.cpp` a través de los bindings `whisper-rs`. Los modelos se descargan de HuggingFace y están sujetos a sus propias licencias de uso.
