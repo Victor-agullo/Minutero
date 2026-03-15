@@ -7,7 +7,10 @@ use std::sync::Arc;
 use std::path::{Path, PathBuf};
 use std::thread;
 use chrono::Local;
-use crate::data::{AudioMessage, DeviceInfo, InterlocutorProfile, SourceType, View};
+use crate::data::{
+    AudioMessage, DeviceInfo, InterlocutorProfile, LanguageConfig, SourceType, View,
+    SOURCE_LANGUAGES,
+};
 use crate::audio::{audio_thread_main, get_available_devices};
 use crate::system_audio::{check_loopback_status, get_loopback_devices, LoopbackStatus, LoopbackInfo};
 
@@ -28,6 +31,9 @@ pub struct TranscriptorApp {
     
     pub loopback_info: Option<LoopbackInfo>,
     pub show_loopback_setup: bool,
+
+    /// Configuración de idioma global para la sesión
+    pub lang_config: LanguageConfig,
 }
 
 impl Default for TranscriptorApp {
@@ -50,6 +56,7 @@ impl Default for TranscriptorApp {
             stop_signal: None,
             loopback_info: None,
             show_loopback_setup: false,
+            lang_config: LanguageConfig::default(), // English → sin traducción
         };
 
         if !app.all_input_devices.is_empty() {
@@ -140,10 +147,11 @@ impl TranscriptorApp {
         self.stop_signal = Some(stop_signal.clone());
         
         let model_name = self.model_name.clone();
-        let num_active = active_interlocutors.len(); 
+        let num_active = active_interlocutors.len();
+        let lang_config = self.lang_config.clone();
         
         thread::spawn(move || {
-            if let Err(e) = audio_thread_main(model_name, tx.clone(), stop_signal, active_interlocutors) {
+            if let Err(e) = audio_thread_main(model_name, tx.clone(), stop_signal, active_interlocutors, lang_config) {
                 let _ = tx.send(AudioMessage::Error(format!("{:?}", e)));
             }
         });
@@ -233,7 +241,65 @@ impl TranscriptorApp {
     fn settings_ui(&mut self, ui: &mut egui::Ui) {
         ui.heading("⚙️ Configuración de Interlocutores y Audio");
         ui.separator();
-        
+
+        // ── Sección de idioma ──────────────────────────────────────────────
+        ui.label(egui::RichText::new("🌐 Idioma").strong());
+        ui.add_space(4.0);
+
+        ui.add_enabled_ui(!self.is_running, |ui| {
+            ui.horizontal(|ui| {
+                // Idioma original
+                ui.label("Idioma original:");
+                egui::ComboBox::from_id_salt("lang_source")
+                    .selected_text(self.lang_config.source_label())
+                    .width(160.0)
+                    .show_ui(ui, |ui| {
+                        for (label, code) in SOURCE_LANGUAGES {
+                            ui.selectable_value(
+                                &mut self.lang_config.source_lang,
+                                *code,
+                                *label,
+                            );
+                        }
+                    });
+
+                ui.add_space(16.0);
+
+                // Idioma destino
+                ui.label("Idioma destino:");
+                egui::ComboBox::from_id_salt("lang_dest")
+                    .selected_text(self.lang_config.dest_label())
+                    .width(200.0)
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(
+                            &mut self.lang_config.translate_to_english,
+                            false,
+                            "Original (sin traducción)",
+                        );
+                        ui.selectable_value(
+                            &mut self.lang_config.translate_to_english,
+                            true,
+                            "English (traducir)",
+                        );
+                    });
+            });
+
+            // Nota informativa
+            ui.add_space(2.0);
+            ui.label(
+                egui::RichText::new(
+                    "ℹ Whisper solo puede traducir al inglés de forma nativa. \
+                     Para otros destinos se requeriría una API externa."
+                )
+                .small()
+                .color(egui::Color32::GRAY),
+            );
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+
+        // ── Loopback ───────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             if ui.button("📊 Configurar Captura de Salida").clicked() {
                 self.loopback_info = check_loopback_status().ok();
@@ -250,6 +316,7 @@ impl TranscriptorApp {
         
         ui.add_space(10.0);
         
+        // ── Interlocutores ─────────────────────────────────────────────────
         ui.add_enabled_ui(!self.is_running, |ui| {
             ui.label("Añadir nueva fuente de audio:");
             ui.horizontal(|ui| {
@@ -274,7 +341,6 @@ impl TranscriptorApp {
         let input_devices = &self.all_input_devices;
         let output_devices = &self.all_output_devices;
 
-        // Variable para almacenar qué perfil se debe eliminar
         let mut profile_to_remove: Option<usize> = None;
 
         egui::ScrollArea::vertical().show(ui, |ui| {
@@ -318,7 +384,6 @@ impl TranscriptorApp {
                             .hint_text(format!("Interlocutor {}", profile.id))
                     );
 
-                    // Botón de eliminar
                     if ui.button("🗑").clicked() {
                         profile_to_remove = Some(idx);
                     }
@@ -326,7 +391,6 @@ impl TranscriptorApp {
             }
         });
 
-        // Eliminar el perfil después de iterar
         if let Some(idx) = profile_to_remove {
             self.remove_profile(idx);
         }
@@ -441,7 +505,6 @@ impl TranscriptorApp {
     fn remove_profile(&mut self, index: usize) {
         if index < self.interlocutors.len() {
             self.interlocutors.remove(index);
-            // Reindexar todos los perfiles
             for (new_id, profile) in self.interlocutors.iter_mut().enumerate() {
                 profile.id = new_id;
                 profile.name = format!("Interlocutor {}", new_id);
