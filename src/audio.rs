@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::Host;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -10,6 +10,7 @@ use whisper_rs::{FullParams, SamplingStrategy, WhisperContext};
 use tokio::runtime::Runtime;
 use futures_util::StreamExt;
 use reqwest::Client;
+#[cfg(target_os = "linux")]
 use std::process::Command;
 use crate::data::{
     AudioMessage, InterlocutorProfile, LanguageConfig, SourceType, DeviceInfo, UiSender,
@@ -272,7 +273,7 @@ fn run_single_stream_cpal(
         ))?;
 
     let config = device.default_input_config()?;
-    let sample_rate = config.sample_rate().0;
+    let sample_rate = u32::from(config.sample_rate());
     let channels = config.channels() as usize;
 
     let source_icon = match profile.source_type { SourceType::Input => "🎤", SourceType::Output => "🔊" };

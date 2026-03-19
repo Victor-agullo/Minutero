@@ -69,10 +69,18 @@ jobs:
             target
           key: ${{ matrix.target }}-cuda-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Compilar con CUDA
+      - name: Compilar con CUDA (Linux)
+        if: runner.os == 'Linux'
         run: cargo build --release --target ${{ matrix.target }} --features cuda
         env:
-          LIBCLANG_PATH: ${{ runner.os == 'Windows' && 'C:\Program Files\LLVM\bin' || '' }}
+          # Ubuntu 22.04 instala libclang en llvm-14 por defecto
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
+
+      - name: Compilar con CUDA (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release --target ${{ matrix.target }} --features cuda
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
 
       - name: Empaquetar (Linux)
         if: runner.os == 'Linux'
@@ -131,7 +139,6 @@ jobs:
       - name: Compilar sin CUDA
         run: cargo build --release --target ${{ matrix.target }}
         env:
-          # whisper-rs necesita libclang en macOS también
           LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
 
       - name: Empaquetar
@@ -144,7 +151,7 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
-  # ── Crear dos GitHub Releases diferenciadas ──────────────────────────────
+  # ── Crear GitHub Releases ────────────────────────────────────────────────
   release:
     needs: [build-cuda, build-cpu-macos]
     runs-on: ubuntu-latest
@@ -172,12 +179,7 @@ jobs:
             - **Windows**: [ffmpeg](https://ffmpeg.org/download.html) añadido al PATH
 
             ### ¿Por qué CUDA solo en Linux y Windows?
-            Apple eliminó el soporte para GPUs NVIDIA en macOS desde 2019. Los Macs
-            modernos usan Apple Silicon (M1/M2/M3), que tiene su propio framework de
-            cómputo (Metal). La versión para macOS usa únicamente CPU optimizada.
-
-            > Si no tienes GPU NVIDIA, descarga la versión CPU de macOS o compila
-            > manualmente sin el feature `cuda`.
+            Apple eliminó el soporte para GPUs NVIDIA en macOS desde 2019.
           files: |
             artifacts/transcriptor-linux-x86_64-cuda.tar.gz
             artifacts/transcriptor-windows-x86_64-cuda.zip
@@ -191,19 +193,9 @@ jobs:
           body: |
             ## 🍎 Versión CPU — macOS (Intel y Apple Silicon)
 
-            Esta release funciona exclusivamente con CPU, sin dependencias de CUDA.
-
             ### Requisitos
             - **ffmpeg**: `brew install ffmpeg`
             - **Captura de audio del sistema**: requiere [BlackHole](https://github.com/ExistentialAudio/BlackHole)
-              (gratuito). Sin él, solo podrás transcribir el micrófono.
-
-            ### ¿Por qué CPU y no GPU?
-            Apple eliminó el soporte para GPUs NVIDIA (CUDA) en macOS desde 2019.
-            Los chips Apple Silicon (M1/M2/M3) usan Metal como framework de cómputo,
-            que actualmente no está soportado por `whisper-rs`. La inferencia en CPU
-            en Apple Silicon es razonablemente rápida gracias a sus unidades de cómputo
-            integradas (especialmente en M2/M3).
 
             ### Intel vs Apple Silicon
             - `transcriptor-macos-intel-cpu` → Macs con procesador Intel
