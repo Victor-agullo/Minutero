@@ -513,7 +513,7 @@ fn calculate_rms(audio: &[f32]) -> f32 {
     (sum_squares / audio.len() as f32).sqrt()
 }
 
-async fn download_whisper_model(model_name: &str) -> Result<String> {
+pub async fn download_whisper_model(model_name: &str) -> Result<String> {
     let models_dir = Path::new("models");
     let model_file = format!("ggml-{}.bin", model_name);
     let model_path = models_dir.join(&model_file);

@@ -91,10 +91,20 @@ pub enum AudioMessage {
     Error(String),
 }
 
+// Mensajes del hilo de transcripción de vídeo
+pub enum VideoMessage {
+    Status(String),
+    Progress(f32),                         // 0.0 – 1.0
+    Segment { timestamp: String, text: String },
+    Done,
+    Error(String),
+}
+
 // Enum para la navegación
 #[derive(Debug, PartialEq, Eq)]
 pub enum View {
     Transcription,
+    Video,
     Settings,
 }
 
