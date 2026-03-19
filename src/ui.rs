@@ -231,10 +231,28 @@ impl TranscriptorApp {
                     sig.store(true, Ordering::SeqCst);
                 }
                 self.is_running = false;
-                match self.save_transcript() {
-                    Ok(p) => self.status_message = format!("✅ Guardado en: {}", p.display()),
-                    Err(e) => self.status_message = format!("❌ Error al guardar: {:?}", e),
-                }
+                // Guardar en hilo separado para no bloquear el render loop
+                // justo cuando el driver está liberando recursos de GPU.
+                let content = self.transcription.clone();
+                let output_dir = self.output_dir.clone();
+                let names: String = self.interlocutors.iter()
+                    .filter(|p| p.is_active)
+                    .map(|p| p.name.replace(' ', "_"))
+                    .collect::<Vec<_>>()
+                    .join("_");
+                thread::spawn(move || {
+                    let timestamp = Local::now().format("%Y%m%d_%H%M%S").to_string();
+                    let path = Path::new(&output_dir).join(format!("{}_{}.md", names, timestamp));
+                    if let Err(e) = std::fs::create_dir_all(&output_dir)
+                        .and_then(|_| std::fs::write(&path, format!(
+                            "# Minuta de Transcripción\n\nFecha: {}\n\n---\n\n{}",
+                            Local::now().format("%d-%m-%Y %H:%M:%S"), content
+                        )))
+                    {
+                        eprintln!("Error al guardar minuta: {:?}", e);
+                    }
+                });
+                self.status_message = "Captura detenida. Guardando minuta...".into();
             } else if self.interlocutors.iter().any(|p| p.is_active) {
                 self.start_audio_capture();
             } else {
