@@ -155,7 +155,7 @@ jobs:
   release:
     needs: [build-cuda, build-cpu-macos]
     runs-on: ubuntu-latest
-    if: startsWith(github.ref, 'refs/tags/')
+    if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
 
     steps:
       - uses: actions/download-artifact@v4
@@ -163,11 +163,21 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      # Si se lanzó manualmente no hay tag; creamos uno temporal con la fecha
+      - name: Determinar nombre de release
+        id: tag
+        run: |
+          if [[ "${{ github.ref }}" == refs/tags/* ]]; then
+            echo "name=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          else
+            echo "name=dev-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
+          fi
+
       - name: Release CUDA (Linux + Windows)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}-cuda
-          name: "${{ github.ref_name }} — CUDA (Linux & Windows)"
+          tag_name: ${{ steps.tag.outputs.name }}-cuda
+          name: "${{ steps.tag.outputs.name }} — CUDA (Linux & Windows)"
           body: |
             ## ⚡ Versión con aceleración CUDA — Linux y Windows
 
@@ -188,8 +198,8 @@ jobs:
       - name: Release CPU (macOS)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ github.ref_name }}-macos
-          name: "${{ github.ref_name }} — CPU (macOS)"
+          tag_name: ${{ steps.tag.outputs.name }}-macos
+          name: "${{ steps.tag.outputs.name }} — CPU (macOS)"
           body: |
             ## 🍎 Versión CPU — macOS (Intel y Apple Silicon)
 
