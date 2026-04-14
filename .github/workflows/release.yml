@@ -143,7 +143,9 @@ jobs:
             intel-oneapi-dnnl \
             intel-oneapi-dnnl-devel \
             intel-oneapi-tbb \
-            intel-oneapi-tbb-devel
+            intel-oneapi-tbb-devel \
+            opencl-headers \
+            ocl-icd-opencl-dev
 
           MKL_LATEST="/opt/intel/oneapi/mkl/latest"
           CMPLR_LATEST="/opt/intel/oneapi/compiler/latest"
@@ -160,6 +162,8 @@ jobs:
           echo "MKL_ROOT=$MKL_LATEST"            >> $GITHUB_ENV
           echo "DNNL_ROOT=$DNNL_LATEST"          >> $GITHUB_ENV
           echo "TBB_ROOT=/opt/intel/oneapi/tbb/latest" >> $GITHUB_ENV
+          # ONEAPI_ROOT is checked by ggml-sycl cmake to select the Intel compiler
+          echo "ONEAPI_ROOT=/opt/intel/oneapi"   >> $GITHUB_ENV
 
           # CMAKE_PREFIX_PATH: añadir también las rutas reales (no symlink) por si acaso
           MKL_REAL=$(realpath $MKL_LATEST)
@@ -168,8 +172,6 @@ jobs:
           TBB_REAL=$(realpath $TBB_LATEST 2>/dev/null || echo $TBB_LATEST)
           echo "CMAKE_PREFIX_PATH=$MKL_LATEST:$DNNL_LATEST:$TBB_LATEST:$MKL_REAL:$DNNL_REAL:$TBB_REAL" >> $GITHUB_ENV
 
-          # CMAKE_ARGS como última capa: apunta directamente a los directorios cmake
-          echo "CMAKE_ARGS=-DMKL_DIR=$MKL_LATEST/lib/cmake/mkl -DDNNL_DIR=$DNNL_LATEST/lib/cmake/dnnl" >> $GITHUB_ENV
 
       - name: "🔍 Debug — Intel oneAPI post-install layout"
         if: matrix.backend == 'intel'
