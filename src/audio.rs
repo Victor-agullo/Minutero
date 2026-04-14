@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait, StreamTrait as _};
 use cpal::Host;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -16,6 +16,7 @@ use crate::data::{
     AudioMessage, InterlocutorProfile, LanguageConfig, SourceType, DeviceInfo, UiSender,
     WHISPER_SAMPLE_RATE, CHUNK_DURATION_SECS, SILENCE_THRESHOLD
 };
+
 // ── Enumeración de dispositivos ────────────────────────────────────────────
 
 pub fn get_available_devices(host: &Host, is_input: bool) -> Vec<DeviceInfo> {
