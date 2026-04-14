@@ -1,5 +1,5 @@
 use anyhow::{Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+use cpal::traits::{DeviceTrait, HostTrait};
 use cpal::Host;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
