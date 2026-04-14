@@ -7,7 +7,7 @@
 
 set -euo pipefail
 
-REPO="tu-usuario/transcriptor"   # <── cambia esto
+REPO="Victor-agullo/Minutero"
 APP_NAME="transcriptor"
 DEFAULT_INSTALL_DIR="$HOME/.local/bin"
 

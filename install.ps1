@@ -12,7 +12,7 @@ param(
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 
-$REPO     = "tu-usuario/transcriptor"   # <── cambia esto
+$REPO = "Victor-agullo/Minutero"
 $APP_NAME = "transcriptor"
 
 # ── Helpers ───────────────────────────────────────────────────────────────
