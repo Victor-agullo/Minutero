@@ -76,6 +76,18 @@ jobs:
           cuda: '12.4.0'
 
       # ── ROCm ────────────────────────────────────────────────────────────
+      - name: "🔍 Debug — ROCm preinstalled packages"
+        if: matrix.backend == 'rocm'
+        run: |
+          echo "=== dpkg: all rocm/hip/hsa/comgr packages ==="
+          dpkg -l '*rocm*' '*hip*' '*hsa*' '*comgr*' '*rocprofiler*' '*rocminfo*' 2>/dev/null || true
+          echo "=== apt-mark: held packages ==="
+          apt-mark showhold 2>/dev/null || true
+          echo "=== /opt/rocm exists? ==="
+          ls /opt/rocm 2>/dev/null || echo "(not present)"
+          echo "=== Ubuntu release ==="
+          lsb_release -a 2>/dev/null || cat /etc/os-release
+
       - name: ROCm SDK
         if: matrix.backend == 'rocm'
         run: |
@@ -93,7 +105,7 @@ jobs:
             | sudo tee /etc/apt/sources.list.d/rocm.list
 
           # Dar prioridad al repo de AMD sobre paquetes del sistema
-          printf 'Package: rocm-* hip* hsa-* comgr*\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' \
+          printf 'Package: rocminfo rocm-* hip* hsa-* comgr*\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' \
             | sudo tee /etc/apt/preferences.d/rocm.pref
 
           sudo apt-get update
@@ -103,6 +115,18 @@ jobs:
           echo "HIP_PATH=/opt/rocm"    >> $GITHUB_ENV
 
       # ── Intel oneAPI SYCL ───────────────────────────────────────────────
+      - name: "🔍 Debug — Intel oneAPI environment"
+        if: matrix.backend == 'intel'
+        run: |
+          echo "=== GPU devices ==="
+          lspci 2>/dev/null | grep -iE "VGA|3D|Display|Video" || true
+          echo "=== oneAPI already installed? ==="
+          ls /opt/intel/oneapi 2>/dev/null || echo "(not present)"
+          echo "=== Ubuntu release ==="
+          lsb_release -a 2>/dev/null || cat /etc/os-release
+          echo "=== cmake version ==="
+          cmake --version 2>/dev/null || echo "cmake not found"
+
       - name: Intel oneAPI Base Toolkit
         if: matrix.backend == 'intel'
         run: |
@@ -114,15 +138,36 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel
 
-          # setvars.sh no propaga al siguiente step en GH Actions — exportar manualmente
+          # Detectar versión instalada y exportar rutas
           MKL_VER=$(ls /opt/intel/oneapi/mkl/ | grep -v latest | sort -V | tail -1)
           CMPLR_VER=$(ls /opt/intel/oneapi/compiler/ | grep -v latest | sort -V | tail -1)
-          echo "CMPLR_ROOT=/opt/intel/oneapi/compiler/$CMPLR_VER"              >> $GITHUB_ENV
-          echo "MKLROOT=/opt/intel/oneapi/mkl/$MKL_VER"                        >> $GITHUB_ENV
-          echo "MKL_DIR=/opt/intel/oneapi/mkl/$MKL_VER/lib/cmake/mkl"         >> $GITHUB_ENV
-          echo "CMAKE_PREFIX_PATH=/opt/intel/oneapi/mkl/$MKL_VER"             >> $GITHUB_ENV
-          echo "/opt/intel/oneapi/compiler/$CMPLR_VER/bin"                    >> $GITHUB_PATH
-          echo "LD_LIBRARY_PATH=/opt/intel/oneapi/mkl/$MKL_VER/lib/intel64:/opt/intel/oneapi/compiler/$CMPLR_VER/linux/compiler/lib/intel64_lin" >> $GITHUB_ENV
+          MKL_ROOT="/opt/intel/oneapi/mkl/$MKL_VER"
+          CMPLR_ROOT="/opt/intel/oneapi/compiler/$CMPLR_VER"
+
+          echo "CMPLR_ROOT=$CMPLR_ROOT"                   >> $GITHUB_ENV
+          echo "MKLROOT=$MKL_ROOT"                        >> $GITHUB_ENV
+          echo "$CMPLR_ROOT/bin"                          >> $GITHUB_PATH
+          echo "LD_LIBRARY_PATH=$MKL_ROOT/lib/intel64:$CMPLR_ROOT/linux/compiler/lib/intel64_lin" >> $GITHUB_ENV
+
+          # whisper-rs-sys pasa CMAKE_ARGS a la build de whisper.cpp
+          # MKL_DIR le indica a cmake dónde está MKLConfig.cmake
+          echo "CMAKE_ARGS=-DMKL_DIR=$MKL_ROOT/lib/cmake/mkl -DCMAKE_PREFIX_PATH=$MKL_ROOT" >> $GITHUB_ENV
+
+      - name: "🔍 Debug — Intel oneAPI post-install layout"
+        if: matrix.backend == 'intel'
+        run: |
+          echo "=== MKLConfig.cmake locations ==="
+          find /opt/intel/oneapi -name "MKLConfig.cmake" 2>/dev/null || echo "(not found)"
+          echo "=== MKL versions ==="
+          ls /opt/intel/oneapi/mkl/ 2>/dev/null || echo "(mkl not installed)"
+          echo "=== Compiler versions ==="
+          ls /opt/intel/oneapi/compiler/ 2>/dev/null || echo "(compiler not installed)"
+          echo "=== CMAKE_ARGS env ==="
+          echo "${CMAKE_ARGS:-<not set>}"
+          echo "=== icpx available? ==="
+          which icpx 2>/dev/null || echo "(icpx not in PATH)"
+          echo "=== SYCL headers present? ==="
+          find /opt/intel/oneapi -name "sycl.hpp" 2>/dev/null | head -3 || echo "(not found)"
 
       - name: Caché Cargo
         uses: actions/cache@v4
@@ -132,6 +177,21 @@ jobs:
             ~/.cargo/git
             target
           key: linux-${{ matrix.backend }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: "🔍 Debug — whisper-rs-sys build.rs & cargo env"
+        run: |
+          echo "=== whisper-rs-sys build.rs ==="
+          find ~/.cargo/registry/src -path "*/whisper-rs-sys-*/build.rs" 2>/dev/null \
+            | head -1 | xargs cat 2>/dev/null || echo "(run cargo fetch first or not cached yet)"
+          echo "=== Cargo.toml features active ==="
+          cargo metadata --no-deps --format-version 1 2>/dev/null \
+            | python3 -c "import json,sys; m=json.load(sys.stdin); [print(p['name'], p.get('features',{})) for p in m['packages'] if 'whisper' in p['name']]" || true
+          echo "=== LIBCLANG_PATH content ==="
+          ls /usr/lib/llvm-14/lib 2>/dev/null | grep clang | head -5 || echo "(llvm-14 not found)"
+          echo "=== Available llvm versions ==="
+          ls /usr/lib/ | grep llvm || true
+        env:
+          LIBCLANG_PATH: /usr/lib/llvm-14/lib
 
       - name: Compilar
         run: |
