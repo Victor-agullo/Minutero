@@ -7,14 +7,14 @@ edition = "2021"
 anyhow = "1.0.102"
 chrono = "0.4.44"
 cpal = "0.17.3"
-eframe = "0.34.1"
-egui = "0.34.1"
+eframe = "0.33.3"
+egui = "0.33.3"
 futures-util = "0.3.32"
 num-traits = "0.2.19"
-rubato = "2.0.0"
+rubato = "1.0.1"
 reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "stream"] }
-rfd = "0.17.2"
-tokio = { version = "1.51.1", features = ["full"] }
+rfd = "0.17.*"
+tokio = { version = "1.50.0", features = ["full"] }
 whisper-rs = { version = "0.16.0" }
 
 [features]
@@ -37,4 +37,4 @@ metal     = ["whisper-rs/metal", "whisper-rs/coreml"]
 directml  = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.185"
+libc = "0.2.183"

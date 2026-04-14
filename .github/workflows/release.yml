@@ -81,7 +81,7 @@ jobs:
         run: |
           # Ubuntu 22.04 trae versiones antiguas de rocm-* que conflictúan con ROCm 6.1.
           sudo apt-get remove -y --allow-change-held-packages \
-            rocm-cmake rocm-device-libs rocm-utils \
+            rocminfo rocm-cmake rocm-device-libs rocm-utils \
             rocprofiler rocprofiler-dev rocprofiler-plugins \
             2>/dev/null || true
           sudo apt-get autoremove -y 2>/dev/null || true
