@@ -7,18 +7,34 @@ edition = "2021"
 anyhow = "1.0.102"
 chrono = "0.4.44"
 cpal = "0.17.3"
-eframe = "0.33.3"
-egui = "0.33.3"
+eframe = "0.34.1"
+egui = "0.34.1"
 futures-util = "0.3.32"
 num-traits = "0.2.19"
-rubato = "1.0.1"
-reqwest = { version = "0.12.*", default-features = false, features = ["rustls-tls", "stream"] }
-rfd = "0.17.*"
-tokio = { version = "1.50.0", features = ["full"] }
-whisper-rs = {version="0.16.0"}
+rubato = "2.0.0"
+reqwest = { version = "0.13.2", default-features = false, features = ["rustls-tls", "stream"] }
+rfd = "0.17.2"
+tokio = { version = "1.51.1", features = ["full"] }
+whisper-rs = { version = "0.16" }
 
 [features]
-cuda = ["whisper-rs/cuda"]
+# ── Aceleración por GPU ────────────────────────────────────────────────────
+# NVIDIA — Linux y Windows
+cuda      = ["whisper-rs/cuda"]
+
+# AMD — Linux (ROCm/HIP). Requiere ROCm SDK instalado.
+rocm      = ["whisper-rs/hipblas"]
+
+# Intel — Linux (oneAPI SYCL). Requiere Intel oneAPI Base Toolkit.
+intel     = ["whisper-rs/intel-sycl"]
+
+# Apple Silicon — macOS (Metal + Neural Engine via CoreML)
+metal     = ["whisper-rs/metal", "whisper-rs/coreml"]
+
+# Windows AMD + Intel — DirectML (Windows 10/11, sin drivers extra).
+# No es un feature de whisper-rs; se activa via CMAKE_ARGS en el workflow.
+# Este feature sirve como marcador para el instalador.
+directml  = []
 
 [target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.183"
+libc = "0.2.185"

@@ -6,25 +6,50 @@ on:
       - 'v*'
   workflow_dispatch:
 
+# ════════════════════════════════════════════════════════════════════════════
+#  MATRIX DE BUILDS
+#
+#  Linux:
+#    · linux-x86_64-cuda      — NVIDIA  (CUDA 12.x)
+#    · linux-x86_64-rocm      — AMD     (ROCm 6.x)
+#    · linux-x86_64-intel     — Intel   (oneAPI SYCL)
+#    · linux-x86_64-cpu       — fallback sin GPU
+#
+#  Windows:
+#    · windows-x86_64-cuda    — NVIDIA  (CUDA 12.x, DLLs incluidas)
+#    · windows-x86_64-directml— AMD + Intel (DirectML, Windows 10/11)
+#    · windows-x86_64-cpu     — fallback sin GPU
+#
+#  macOS:
+#    · macos-intel-cpu                — Intel (x86_64)
+#    · macos-apple-silicon-metal      — Apple Silicon M1/M2/M3/M4 (Metal + CoreML)
+# ════════════════════════════════════════════════════════════════════════════
+
 jobs:
-  # ── Release CUDA (Linux + Windows) ──────────────────────────────────────
-  build-cuda:
+  # ── Linux: todos los backends ────────────────────────────────────────────
+  build-linux:
     strategy:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
+          - backend: cuda
             artifact: transcriptor-linux-x86_64-cuda
-            binary: transcriptor
+            features: cuda
 
-          - os: windows-latest
-            target: x86_64-pc-windows-msvc
-            artifact: transcriptor-windows-x86_64-cuda
-            binary: transcriptor.exe
+          - backend: rocm
+            artifact: transcriptor-linux-x86_64-rocm
+            features: rocm
 
-    runs-on: ${{ matrix.os }}
-    name: "CUDA — ${{ matrix.artifact }}"
+          - backend: intel
+            artifact: transcriptor-linux-x86_64-intel
+            features: intel
+
+          - backend: cpu
+            artifact: transcriptor-linux-x86_64-cpu
+            features: ""
+
+    runs-on: ubuntu-22.04
+    name: "Linux — ${{ matrix.artifact }}"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,33 +57,54 @@ jobs:
       - name: Instalar Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ matrix.target }}
+          targets: x86_64-unknown-linux-gnu
 
-      - name: Dependencias Linux
-        if: runner.os == 'Linux'
+      - name: Dependencias base
         run: |
           sudo apt-get update
           sudo apt-get install -y \
             libclang-dev libasound2-dev \
             libgtk-3-dev \
             libxcb-render0-dev libxcb-shape0-dev libxcb-xfixes0-dev \
-            libxkbcommon-dev libssl-dev ffmpeg
+            libxkbcommon-dev libssl-dev ffmpeg cmake
 
-      - name: CUDA Toolkit (Linux)
-        if: runner.os == 'Linux'
+      # ── CUDA ────────────────────────────────────────────────────────────
+      - name: CUDA Toolkit
+        if: matrix.backend == 'cuda'
         uses: Jimver/cuda-toolkit@v0.2.15
         with:
           cuda: '12.4.0'
 
-      - name: CUDA Toolkit (Windows)
-        if: runner.os == 'Windows'
-        uses: Jimver/cuda-toolkit@v0.2.15
-        with:
-          cuda: '12.4.0'
+      # ── ROCm ────────────────────────────────────────────────────────────
+      - name: ROCm SDK
+        if: matrix.backend == 'rocm'
+        run: |
+          wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
+            | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
+          echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
+            https://repo.radeon.com/rocm/apt/6.1 jammy main" \
+            | sudo tee /etc/apt/sources.list.d/rocm.list
+          sudo apt-get update
+          sudo apt-get install -y rocm-dev hipblas-dev
+          echo "/opt/rocm/bin" >> $GITHUB_PATH
+          echo "ROCM_PATH=/opt/rocm"   >> $GITHUB_ENV
+          echo "HIP_PATH=/opt/rocm"    >> $GITHUB_ENV
 
-      - name: LLVM (Windows)
-        if: runner.os == 'Windows'
-        run: choco install llvm -y
+      # ── Intel oneAPI SYCL ───────────────────────────────────────────────
+      - name: Intel oneAPI Base Toolkit
+        if: matrix.backend == 'intel'
+        run: |
+          wget -qO - https://apt.repos.intel.com/intel-gpg-keys/GPG-PUB-KEY-INTEL-SW-PRODUCTS.PUB \
+            | sudo gpg --dearmor -o /usr/share/keyrings/oneapi-archive-keyring.gpg
+          echo "deb [signed-by=/usr/share/keyrings/oneapi-archive-keyring.gpg] \
+            https://apt.repos.intel.com/oneapi all main" \
+            | sudo tee /etc/apt/sources.list.d/oneAPI.list
+          sudo apt-get update
+          sudo apt-get install -y intel-oneapi-compiler-dpcpp-cpp intel-oneapi-mkl-devel
+          source /opt/intel/oneapi/setvars.sh
+          echo "CMPLR_ROOT=/opt/intel/oneapi/compiler/latest" >> $GITHUB_ENV
+          echo "MKLROOT=/opt/intel/oneapi/mkl/latest"         >> $GITHUB_ENV
+          echo "/opt/intel/oneapi/compiler/latest/bin"        >> $GITHUB_PATH
 
       - name: Caché Cargo
         uses: actions/cache@v4
@@ -67,54 +113,166 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cuda-${{ hashFiles('**/Cargo.lock') }}
+          key: linux-${{ matrix.backend }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Compilar con CUDA (Linux)
-        if: runner.os == 'Linux'
-        run: cargo build --release --target ${{ matrix.target }} --features cuda
+      - name: Compilar
+        run: |
+          FEATURES="${{ matrix.features }}"
+          if [ -n "$FEATURES" ]; then
+            cargo build --release --target x86_64-unknown-linux-gnu --features "$FEATURES"
+          else
+            cargo build --release --target x86_64-unknown-linux-gnu
+          fi
         env:
-          # Ubuntu 22.04 instala libclang en llvm-14 por defecto
           LIBCLANG_PATH: /usr/lib/llvm-14/lib
 
-      - name: Compilar con CUDA (Windows)
-        if: runner.os == 'Windows'
-        run: cargo build --release --target ${{ matrix.target }} --features cuda
-        env:
-          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
-
-      - name: Empaquetar (Linux)
-        if: runner.os == 'Linux'
+      - name: Empaquetar
         run: |
-          cp target/${{ matrix.target }}/release/${{ matrix.binary }} .
-          tar -czf ${{ matrix.artifact }}.tar.gz ${{ matrix.binary }}
-
-      - name: Empaquetar (Windows)
-        if: runner.os == 'Windows'
-        run: |
-          Copy-Item "target\${{ matrix.target }}\release\${{ matrix.binary }}" .
-          Compress-Archive -Path ${{ matrix.binary }} -DestinationPath ${{ matrix.artifact }}.zip
+          cp target/x86_64-unknown-linux-gnu/release/transcriptor .
+          tar -czf ${{ matrix.artifact }}.tar.gz transcriptor
 
       - uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
-          path: |
-            ${{ matrix.artifact }}.tar.gz
-            ${{ matrix.artifact }}.zip
-          if-no-files-found: ignore
+          path: ${{ matrix.artifact }}.tar.gz
 
-  # ── Release CPU (macOS Intel + Apple Silicon) ────────────────────────────
-  build-cpu-macos:
+
+  # ── Windows: todos los backends ──────────────────────────────────────────
+  build-windows:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - backend: cuda
+            artifact: transcriptor-windows-x86_64-cuda
+            features: cuda
+
+          - backend: directml
+            artifact: transcriptor-windows-x86_64-directml
+            features: ""
+
+          - backend: cpu
+            artifact: transcriptor-windows-x86_64-cpu
+            features: ""
+
+    runs-on: windows-latest
+    name: "Windows — ${{ matrix.artifact }}"
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Instalar Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: LLVM
+        run: choco install llvm -y
+
+      - name: CUDA Toolkit
+        if: matrix.backend == 'cuda'
+        uses: Jimver/cuda-toolkit@v0.2.15
+        with:
+          cuda: '12.4.0'
+
+      # DirectML está incluido en el Windows SDK — solo activar el flag cmake.
+      # whisper-rs-sys respeta la variable CMAKE_ARGS y la pasa a la build de whisper.cpp.
+      - name: Configurar DirectML
+        if: matrix.backend == 'directml'
+        shell: pwsh
+        run: |
+          echo "CMAKE_ARGS=-DGGML_DIRECTML=ON" >> $env:GITHUB_ENV
+
+      - name: Caché Cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: windows-${{ matrix.backend }}-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Compilar
+        shell: pwsh
+        run: |
+          $features = "${{ matrix.features }}"
+          if ($features) {
+            cargo build --release --target x86_64-pc-windows-msvc --features $features
+          } else {
+            cargo build --release --target x86_64-pc-windows-msvc
+          }
+        env:
+          LIBCLANG_PATH: 'C:\Program Files\LLVM\bin'
+
+      # Empaquetar — CUDA: incluir DLLs runtime para que funcione sin CUDA instalado
+      - name: Empaquetar (CUDA)
+        if: matrix.backend == 'cuda'
+        shell: pwsh
+        run: |
+          $srcDir  = "target\x86_64-pc-windows-msvc\release"
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v12.4\bin"
+          $dlls = @(
+            "cublas64_12.dll", "cublasLt64_12.dll",
+            "cudart64_120.dll", "cufft64_11.dll", "curand64_10.dll"
+          )
+          foreach ($dll in $dlls) {
+            $src = "$cudaBin\$dll"
+            if (Test-Path $src) { Copy-Item $src $srcDir; Write-Host "DLL incluida: $dll" }
+          }
+          $files = @("$srcDir\transcriptor.exe") + (Get-ChildItem "$srcDir\*.dll" | % { $_.FullName })
+          Compress-Archive -Path $files -DestinationPath "${{ matrix.artifact }}.zip"
+
+      # DirectML.dll viene en Windows 10/11, pero la incluimos por portabilidad
+      - name: Empaquetar (DirectML)
+        if: matrix.backend == 'directml'
+        shell: pwsh
+        run: |
+          $srcDir = "target\x86_64-pc-windows-msvc\release"
+          # Buscar DirectML.dll en el Windows SDK
+          $dmlDll = Get-ChildItem "C:\Windows\System32\DirectML.dll" -ErrorAction SilentlyContinue
+          if (-not $dmlDll) {
+            $dmlDll = Get-ChildItem "C:\Program Files (x86)\Windows Kits\10\bin\*\x64\DirectML.dll" `
+              -ErrorAction SilentlyContinue | Sort-Object FullName -Descending | Select-Object -First 1
+          }
+          if ($dmlDll) {
+            Copy-Item $dmlDll.FullName $srcDir
+            Write-Host "DirectML.dll incluida desde: $($dmlDll.FullName)"
+          } else {
+            Write-Warning "DirectML.dll no encontrada en SDK. Windows 10/11 la tiene nativa."
+          }
+          $files = @("$srcDir\transcriptor.exe") + (Get-ChildItem "$srcDir\*.dll" | % { $_.FullName })
+          Compress-Archive -Path $files -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - name: Empaquetar (CPU)
+        if: matrix.backend == 'cpu'
+        shell: pwsh
+        run: |
+          $srcDir = "target\x86_64-pc-windows-msvc\release"
+          Compress-Archive -Path "$srcDir\transcriptor.exe" -DestinationPath "${{ matrix.artifact }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.zip
+
+
+  # ── macOS ────────────────────────────────────────────────────────────────
+  build-macos:
     strategy:
       fail-fast: false
       matrix:
         include:
           - target: x86_64-apple-darwin
             artifact: transcriptor-macos-intel-cpu
+            features: ""
+
+          # Metal (GPU) + CoreML (Neural Engine) para Apple Silicon
           - target: aarch64-apple-darwin
-            artifact: transcriptor-macos-apple-silicon-cpu
+            artifact: transcriptor-macos-apple-silicon-metal
+            features: metal
 
     runs-on: macos-latest
-    name: "CPU — ${{ matrix.artifact }}"
+    name: "macOS — ${{ matrix.artifact }}"
 
     steps:
       - uses: actions/checkout@v4
@@ -134,10 +292,16 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ matrix.target }}-cpu-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ matrix.target }}-${{ matrix.features }}-${{ hashFiles('**/Cargo.lock') }}
 
-      - name: Compilar sin CUDA
-        run: cargo build --release --target ${{ matrix.target }}
+      - name: Compilar
+        run: |
+          FEATURES="${{ matrix.features }}"
+          if [ -n "$FEATURES" ]; then
+            cargo build --release --target ${{ matrix.target }} --features "$FEATURES"
+          else
+            cargo build --release --target ${{ matrix.target }}
+          fi
         env:
           LIBCLANG_PATH: /opt/homebrew/opt/llvm/lib
 
@@ -151,19 +315,21 @@ jobs:
           name: ${{ matrix.artifact }}
           path: ${{ matrix.artifact }}.tar.gz
 
+
   # ── Crear GitHub Releases ────────────────────────────────────────────────
   release:
-    needs: [build-cuda, build-cpu-macos]
+    needs: [build-linux, build-windows, build-macos]
     runs-on: ubuntu-latest
     if: startsWith(github.ref, 'refs/tags/') || github.event_name == 'workflow_dispatch'
 
     steps:
+      - uses: actions/checkout@v4
+
       - uses: actions/download-artifact@v4
         with:
           path: artifacts
           merge-multiple: true
 
-      # Si se lanzó manualmente no hay tag; creamos uno temporal con la fecha
       - name: Determinar nombre de release
         id: tag
         run: |
@@ -173,44 +339,95 @@ jobs:
             echo "name=dev-$(date +'%Y%m%d-%H%M%S')" >> $GITHUB_OUTPUT
           fi
 
-      - name: Release CUDA (Linux + Windows)
+      - name: Incluir instaladores
+        run: |
+          cp install.ps1 artifacts/
+          cp install.sh  artifacts/
+          chmod +x artifacts/install.sh
+
+      - name: Release Linux
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ steps.tag.outputs.name }}-cuda
-          name: "${{ steps.tag.outputs.name }} — CUDA (Linux & Windows)"
+          tag_name: ${{ steps.tag.outputs.name }}-linux
+          name: "${{ steps.tag.outputs.name }} — Linux"
           body: |
-            ## ⚡ Versión con aceleración CUDA — Linux y Windows
+            ## 🐧 Linux — Todas las variantes
 
-            Esta release utiliza CUDA para acelerar la inferencia de Whisper en GPU NVIDIA.
+            Instalación automática (detecta tu GPU):
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash
+            ```
 
-            ### Requisitos
-            - **GPU NVIDIA** con drivers recientes (CUDA 12.x)
-            - **Linux**: `ffmpeg`, `pulseaudio-utils` (`pactl`, `parecord`)
-            - **Windows**: [ffmpeg](https://ffmpeg.org/download.html) añadido al PATH
+            | Archivo | GPU | Requisitos |
+            |---|---|---|
+            | `transcriptor-linux-x86_64-cuda.tar.gz` | NVIDIA | CUDA Runtime 12.x |
+            | `transcriptor-linux-x86_64-rocm.tar.gz` | AMD Radeon | ROCm 6.x |
+            | `transcriptor-linux-x86_64-intel.tar.gz` | Intel Arc/Xe | Intel oneAPI Base Toolkit |
+            | `transcriptor-linux-x86_64-cpu.tar.gz` | Cualquiera | Solo `ffmpeg` + `pulseaudio-utils` |
 
-            ### ¿Por qué CUDA solo en Linux y Windows?
-            Apple eliminó el soporte para GPUs NVIDIA en macOS desde 2019.
+            ### Dependencias comunes
+            ```bash
+            sudo apt install ffmpeg pulseaudio-utils   # Debian/Ubuntu
+            sudo dnf install ffmpeg pulseaudio-utils   # Fedora
+            ```
           files: |
             artifacts/transcriptor-linux-x86_64-cuda.tar.gz
-            artifacts/transcriptor-windows-x86_64-cuda.zip
+            artifacts/transcriptor-linux-x86_64-rocm.tar.gz
+            artifacts/transcriptor-linux-x86_64-intel.tar.gz
+            artifacts/transcriptor-linux-x86_64-cpu.tar.gz
+            artifacts/install.sh
           generate_release_notes: false
 
-      - name: Release CPU (macOS)
+      - name: Release Windows
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.name }}-windows
+          name: "${{ steps.tag.outputs.name }} — Windows"
+          body: |
+            ## 🪟 Windows — Todas las variantes
+
+            Instalación automática (detecta tu GPU):
+            ```powershell
+            irm https://github.com/${{ github.repository }}/releases/latest/download/install.ps1 | iex
+            ```
+
+            | Archivo | GPU | Notas |
+            |---|---|---|
+            | `transcriptor-windows-x86_64-cuda.zip` | NVIDIA | DLLs de CUDA incluidas |
+            | `transcriptor-windows-x86_64-directml.zip` | AMD / Intel | DirectML nativo en Windows 10/11 |
+            | `transcriptor-windows-x86_64-cpu.zip` | Cualquiera | Sin dependencias de GPU |
+
+            ### Dependencias comunes
+            - **ffmpeg**: `winget install Gyan.FFmpeg`
+          files: |
+            artifacts/transcriptor-windows-x86_64-cuda.zip
+            artifacts/transcriptor-windows-x86_64-directml.zip
+            artifacts/transcriptor-windows-x86_64-cpu.zip
+            artifacts/install.ps1
+          generate_release_notes: false
+
+      - name: Release macOS
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.name }}-macos
-          name: "${{ steps.tag.outputs.name }} — CPU (macOS)"
+          name: "${{ steps.tag.outputs.name }} — macOS"
           body: |
-            ## 🍎 Versión CPU — macOS (Intel y Apple Silicon)
+            ## 🍎 macOS — Intel y Apple Silicon
 
-            ### Requisitos
+            ```bash
+            curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | bash
+            ```
+
+            | Archivo | Chip | Backend |
+            |---|---|---|
+            | `transcriptor-macos-intel-cpu.tar.gz` | Intel (x86_64) | CPU |
+            | `transcriptor-macos-apple-silicon-metal.tar.gz` | M1/M2/M3/M4 | Metal GPU + CoreML Neural Engine |
+
+            ### Dependencias
             - **ffmpeg**: `brew install ffmpeg`
-            - **Captura de audio del sistema**: requiere [BlackHole](https://github.com/ExistentialAudio/BlackHole)
-
-            ### Intel vs Apple Silicon
-            - `transcriptor-macos-intel-cpu` → Macs con procesador Intel
-            - `transcriptor-macos-apple-silicon-cpu` → Macs con chip M1/M2/M3
+            - **Audio del sistema**: [BlackHole](https://github.com/ExistentialAudio/BlackHole)
           files: |
             artifacts/transcriptor-macos-intel-cpu.tar.gz
-            artifacts/transcriptor-macos-apple-silicon-cpu.tar.gz
+            artifacts/transcriptor-macos-apple-silicon-metal.tar.gz
+            artifacts/install.sh
           generate_release_notes: false
