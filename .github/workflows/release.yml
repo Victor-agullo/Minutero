@@ -79,11 +79,23 @@ jobs:
       - name: ROCm SDK
         if: matrix.backend == 'rocm'
         run: |
+          # Ubuntu 22.04 trae versiones antiguas de rocm-* que conflictúan con ROCm 6.1.
+          sudo apt-get remove -y --allow-change-held-packages \
+            rocm-cmake rocm-device-libs rocm-utils \
+            rocprofiler rocprofiler-dev rocprofiler-plugins \
+            2>/dev/null || true
+          sudo apt-get autoremove -y 2>/dev/null || true
+
           wget -qO - https://repo.radeon.com/rocm/rocm.gpg.key \
             | sudo gpg --dearmor -o /etc/apt/keyrings/rocm.gpg
           echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/rocm.gpg] \
             https://repo.radeon.com/rocm/apt/6.1 jammy main" \
             | sudo tee /etc/apt/sources.list.d/rocm.list
+
+          # Dar prioridad al repo de AMD sobre paquetes del sistema
+          printf 'Package: rocm-* hip* hsa-* comgr*\nPin: origin repo.radeon.com\nPin-Priority: 1001\n' \
+            | sudo tee /etc/apt/preferences.d/rocm.pref
+
           sudo apt-get update
           sudo apt-get install -y rocm-dev hipblas-dev
           echo "/opt/rocm/bin" >> $GITHUB_PATH
