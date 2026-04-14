@@ -136,25 +136,29 @@ jobs:
             https://apt.repos.intel.com/oneapi all main" \
             | sudo tee /etc/apt/sources.list.d/oneAPI.list
           sudo apt-get update
-          # intel-oneapi-mkl instala MKLConfig.cmake; -devel añade cabeceras
           sudo apt-get install -y \
             intel-oneapi-compiler-dpcpp-cpp \
             intel-oneapi-mkl \
-            intel-oneapi-mkl-devel
+            intel-oneapi-mkl-devel \
+            intel-oneapi-dnnl \
+            intel-oneapi-dnnl-devel
 
-          # Intel siempre crea el symlink 'latest' → usarlo evita detectar versión
           MKL_LATEST="/opt/intel/oneapi/mkl/latest"
           CMPLR_LATEST="/opt/intel/oneapi/compiler/latest"
+          DNNL_LATEST="/opt/intel/oneapi/dnnl/latest"
 
-          echo "CMPLR_ROOT=$CMPLR_LATEST"                                       >> $GITHUB_ENV
-          echo "MKLROOT=$MKL_LATEST"                                            >> $GITHUB_ENV
-          echo "$CMPLR_LATEST/bin"                                              >> $GITHUB_PATH
+          echo "CMPLR_ROOT=$CMPLR_LATEST"        >> $GITHUB_ENV
+          echo "MKLROOT=$MKL_LATEST"             >> $GITHUB_ENV
+          echo "$CMPLR_LATEST/bin"               >> $GITHUB_PATH
           echo "LD_LIBRARY_PATH=$MKL_LATEST/lib/intel64:$CMPLR_LATEST/linux/compiler/lib/intel64_lin" >> $GITHUB_ENV
 
-          # CMAKE_ARGS es leído por whisper-rs-sys para pasárselo a cmake.
-          # MKL_DIR apunta a la carpeta que contiene MKLConfig.cmake.
-          # CMAKE_PREFIX_PATH como fallback si MKL_DIR no es suficiente.
-          echo "CMAKE_ARGS=-DMKL_DIR=$MKL_LATEST/lib/cmake/mkl -DCMAKE_PREFIX_PATH=$MKL_LATEST" >> $GITHUB_ENV
+          # cmake busca CMAKE_PREFIX_PATH como variable de entorno nativa —
+          # esto hace que find_package(MKL) y find_package(DNNL) funcionen
+          # sin depender de que whisper-rs-sys reenvíe CMAKE_ARGS.
+          echo "CMAKE_PREFIX_PATH=$MKL_LATEST:$DNNL_LATEST" >> $GITHUB_ENV
+
+          # CMAKE_ARGS como capa adicional por si whisper-rs-sys sí la lee
+          echo "CMAKE_ARGS=-DMKL_DIR=$MKL_LATEST/lib/cmake/mkl -DDNNL_DIR=$DNNL_LATEST/lib/cmake/dnnl" >> $GITHUB_ENV
 
       - name: "🔍 Debug — Intel oneAPI post-install layout"
         if: matrix.backend == 'intel'
