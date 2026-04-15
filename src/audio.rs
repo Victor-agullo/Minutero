@@ -1,8 +1,10 @@
 use anyhow::{Result, anyhow};
-use cpal::traits::{DeviceTrait, HostTrait, StreamTrait as _};
+use cpal::traits::{DeviceTrait, HostTrait};
+#[cfg(not(target_os = "linux"))]
+use cpal::traits::StreamTrait as _;
 use cpal::Host;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::path::Path;
 use std::io::Write;
 use std::thread;
@@ -13,8 +15,13 @@ use reqwest::Client;
 #[cfg(target_os = "linux")]
 use std::process::Command;
 use crate::data::{
-    AudioMessage, InterlocutorProfile, LanguageConfig, SourceType, DeviceInfo, UiSender,
-    WHISPER_SAMPLE_RATE, CHUNK_DURATION_SECS, SILENCE_THRESHOLD
+    AudioMessage, DiarizeConfig, InterlocutorProfile, LanguageConfig,
+    SourceType, DeviceInfo, UiSender,
+    WHISPER_SAMPLE_RATE, CHUNK_DURATION_SECS, SILENCE_THRESHOLD,
+};
+use crate::diarize::{
+    DiarizeEngine, IncrementalClusterer, download_diarize_model,
+    DEFAULT_DIARIZE_MODEL_URL,
 };
 
 // ── Enumeración de dispositivos ────────────────────────────────────────────
@@ -26,7 +33,6 @@ pub fn get_available_devices(host: &Host, is_input: bool) -> Vec<DeviceInfo> {
     }
 
     let mut devices: Vec<DeviceInfo> = Vec::new();
-
     let iter = if is_input { host.input_devices() } else { host.output_devices() };
 
     if let Ok(device_list) = iter {
@@ -35,8 +41,6 @@ pub fn get_available_devices(host: &Host, is_input: bool) -> Vec<DeviceInfo> {
             if let Ok(desc) = device.description() {
                 let name = desc.name().to_string();
 
-                // En Linux filtramos monitores del listado de inputs normales
-                // (los monitores se listan aparte vía system_audio)
                 #[cfg(target_os = "linux")]
                 if is_input && (name.contains(".monitor") || name.contains("Monitor of")) {
                     continue;
@@ -45,8 +49,6 @@ pub fn get_available_devices(host: &Host, is_input: bool) -> Vec<DeviceInfo> {
                 devices.push(DeviceInfo {
                     id: real_index,
                     name: name.clone(),
-                    // technical_name en todas las plataformas para poder
-                    // encontrar el dispositivo por nombre en cpal más tarde
                     technical_name: Some(name),
                 });
                 real_index += 1;
@@ -110,11 +112,41 @@ pub fn audio_thread_main(
     stop_signal: Arc<AtomicBool>,
     profiles: Vec<InterlocutorProfile>,
     lang_config: LanguageConfig,
+    diarize_config: DiarizeConfig,
 ) -> Result<()> {
-    tx_ui.send(AudioMessage::Status("Verificando modelo...".to_string()))?;
+    tx_ui.send(AudioMessage::Status("Verificando modelo Whisper...".to_string()))?;
 
     let model_path = Runtime::new()?
         .block_on(download_whisper_model(&model_name))?;
+
+    // Cargar motor de diarización si está habilitado
+    let diarize_engine: Option<Arc<Mutex<DiarizeEngine>>> = if diarize_config.enabled {
+        tx_ui.send(AudioMessage::Status("Cargando modelo de diarización...".to_string()))?;
+        match Runtime::new()?.block_on(download_diarize_model(DEFAULT_DIARIZE_MODEL_URL)) {
+            Ok(diarize_path) => match DiarizeEngine::new(&diarize_path) {
+                Ok(engine) => {
+                    tx_ui.send(AudioMessage::Status("✅ Diarización lista.".to_string()))?;
+                    Some(Arc::new(Mutex::new(engine)))
+                }
+                Err(e) => {
+                    tx_ui.send(AudioMessage::Status(format!(
+                        "⚠️ Diarización no disponible: {:?}", e
+                    )))?;
+                    None
+                }
+            },
+            Err(e) => {
+                tx_ui.send(AudioMessage::Status(format!(
+                    "⚠️ Modelo diarización no descargado: {:?}", e
+                )))?;
+                None
+            }
+        }
+    } else {
+        None
+    };
+
+    let threshold = diarize_config.threshold;
 
     for profile in profiles {
         let tx_func = tx_ui.clone();
@@ -123,9 +155,10 @@ pub fn audio_thread_main(
         let model   = model_path.clone();
         let lang    = lang_config.clone();
         let name    = profile.name.clone();
+        let engine  = diarize_engine.clone();
 
         thread::spawn(move || {
-            if let Err(e) = run_single_stream(profile, model, tx_func, stop, lang) {
+            if let Err(e) = run_single_stream(profile, model, tx_func, stop, lang, engine, threshold) {
                 let _ = tx_err.send(AudioMessage::Error(format!("Error en {}: {:?}", name, e)));
             }
         });
@@ -145,12 +178,20 @@ fn run_single_stream(
     tx_ui: UiSender,
     stop_signal: Arc<AtomicBool>,
     lang_config: LanguageConfig,
+    diarize_engine: Option<Arc<Mutex<DiarizeEngine>>>,
+    diarize_threshold: f32,
 ) -> Result<()> {
     #[cfg(target_os = "linux")]
-    return run_single_stream_linux(profile, model_path, tx_ui, stop_signal, lang_config);
+    return run_single_stream_linux(
+        profile, model_path, tx_ui, stop_signal, lang_config,
+        diarize_engine, diarize_threshold,
+    );
 
     #[cfg(not(target_os = "linux"))]
-    run_single_stream_cpal(profile, model_path, tx_ui, stop_signal, lang_config)
+    run_single_stream_cpal(
+        profile, model_path, tx_ui, stop_signal, lang_config,
+        diarize_engine, diarize_threshold,
+    )
 }
 
 // ── Captura Linux (parecord / PipeWire) ───────────────────────────────────
@@ -162,6 +203,8 @@ fn run_single_stream_linux(
     tx_ui: UiSender,
     stop_signal: Arc<AtomicBool>,
     lang_config: LanguageConfig,
+    diarize_engine: Option<Arc<Mutex<DiarizeEngine>>>,
+    diarize_threshold: f32,
 ) -> Result<()> {
     use std::process::Stdio;
     use std::io::Read;
@@ -170,6 +213,8 @@ fn run_single_stream_linux(
         .map_err(|e| anyhow!("Error cargando modelo: {:?}", e))?;
     let mut state = ctx.create_state()
         .map_err(|e| anyhow!("Error creando estado: {:?}", e))?;
+
+    let mut clusterer = diarize_engine.as_ref().map(|_| IncrementalClusterer::new(diarize_threshold));
 
     let device_name = profile.technical_name
         .ok_or_else(|| anyhow!("Dispositivo sin nombre técnico. Recarga la aplicación."))?;
@@ -184,10 +229,11 @@ fn run_single_stream_linux(
     }
 
     let source_icon = match profile.source_type { SourceType::Input => "🎤", SourceType::Output => "🔊" };
+    let diarize_tag = if diarize_engine.is_some() { " [diarización ON]" } else { "" };
     tx_ui.send(AudioMessage::Status(format!(
-        "{} {} - {} (16kHz mono) [{}→{}]",
+        "{} {} - {} (16kHz mono) [{}→{}]{}",
         source_icon, profile.name, device_name,
-        lang_config.source_label(), lang_config.dest_label(),
+        lang_config.source_label(), lang_config.dest_label(), diarize_tag,
     )))?;
 
     let mut child = Command::new("parecord")
@@ -215,7 +261,11 @@ fn run_single_stream_linux(
                     accumulated.push(s as f32 / 32768.0);
                 }
                 if accumulated.len() >= target {
-                    process_and_send(&accumulated[..target], &mut state, &lang_config, &profile.name, &tx_ui)?;
+                    process_and_send(
+                        &accumulated[..target], &mut state, &lang_config,
+                        &profile.name, &tx_ui,
+                        diarize_engine.as_ref(), clusterer.as_mut(),
+                    )?;
                     let overlap = target * 3 / 10;
                     accumulated = accumulated.split_off(accumulated.len().saturating_sub(overlap));
                 }
@@ -231,10 +281,6 @@ fn run_single_stream_linux(
 }
 
 // ── Captura multiplataforma (cpal / WASAPI / CoreAudio) ───────────────────
-//
-// Windows : WASAPI — micrófonos + Stereo Mix (si habilitado) como inputs
-// macOS   : CoreAudio — micrófonos + BlackHole/Soundflower como inputs
-// Linux   : solo se usa para outputs cpal (los inputs van por parecord)
 
 #[cfg(not(target_os = "linux"))]
 fn run_single_stream_cpal(
@@ -243,6 +289,8 @@ fn run_single_stream_cpal(
     tx_ui: UiSender,
     stop_signal: Arc<AtomicBool>,
     lang_config: LanguageConfig,
+    diarize_engine: Option<Arc<Mutex<DiarizeEngine>>>,
+    diarize_threshold: f32,
 ) -> Result<()> {
     let host = cpal::default_host();
 
@@ -251,9 +299,8 @@ fn run_single_stream_cpal(
     let mut state = ctx.create_state()
         .map_err(|e| anyhow!("Error creando estado: {:?}", e))?;
 
-    // Buscar dispositivo por nombre técnico en la lista de inputs.
-    // En Windows/macOS, tanto micrófonos como dispositivos loopback
-    // (Stereo Mix, BlackHole) aparecen como inputs en cpal.
+    let mut clusterer = diarize_engine.as_ref().map(|_| IncrementalClusterer::new(diarize_threshold));
+
     let tech_name = profile.technical_name.clone()
         .ok_or_else(|| anyhow!(
             "Dispositivo sin nombre técnico. Reconfigura el perfil en Ajustes."
@@ -277,11 +324,12 @@ fn run_single_stream_cpal(
     let channels = config.channels() as usize;
 
     let source_icon = match profile.source_type { SourceType::Input => "🎤", SourceType::Output => "🔊" };
+    let diarize_tag = if diarize_engine.is_some() { " [diarización ON]" } else { "" };
     tx_ui.send(AudioMessage::Status(format!(
-        "{} {} - {} ({}Hz, {}ch) [{}→{}]",
+        "{} {} - {} ({}Hz, {}ch) [{}→{}]{}",
         source_icon, profile.name, tech_name,
         sample_rate, channels,
-        lang_config.source_label(), lang_config.dest_label(),
+        lang_config.source_label(), lang_config.dest_label(), diarize_tag,
     )))?;
 
     let (audio_tx, audio_rx) = std::sync::mpsc::channel::<Vec<f32>>();
@@ -315,7 +363,11 @@ fn run_single_stream_cpal(
                         accumulated[..target].to_vec()
                     };
 
-                    process_and_send(&audio, &mut state, &lang_config, &profile.name, &tx_ui)?;
+                    process_and_send(
+                        &audio, &mut state, &lang_config,
+                        &profile.name, &tx_ui,
+                        diarize_engine.as_ref(), clusterer.as_mut(),
+                    )?;
 
                     let overlap = target * 3 / 10;
                     accumulated = accumulated.split_off(accumulated.len().saturating_sub(overlap));
@@ -331,13 +383,15 @@ fn run_single_stream_cpal(
 
 // ── Helpers de audio compartidos ──────────────────────────────────────────
 
-/// Normaliza, comprueba silencio y envía a Whisper. Compartido por ambas rutas.
+/// Normaliza, comprueba silencio, transcribe y diariza (si disponible).
 fn process_and_send(
     audio: &[f32],
     state: &mut whisper_rs::WhisperState,
     lang_config: &LanguageConfig,
     name: &str,
     tx_ui: &UiSender,
+    diarize_engine: Option<&Arc<Mutex<DiarizeEngine>>>,
+    clusterer: Option<&mut IncrementalClusterer>,
 ) -> Result<()> {
     let normalized = normalize_audio(audio);
     if calculate_rms(&normalized) < SILENCE_THRESHOLD {
@@ -370,7 +424,21 @@ fn process_and_send(
             }
             let trimmed = text.trim().to_string();
             if !trimmed.is_empty() {
-                tx_ui.send(AudioMessage::Transcription { text: trimmed, name: name.to_string() })?;
+                // Diarización en tiempo real: extraer embedding + asignar speaker
+                let speaker_id = match (diarize_engine, clusterer) {
+                    (Some(engine_arc), Some(clust)) => {
+                        engine_arc.lock().ok()
+                            .and_then(|mut engine| engine.extract_embedding(&normalized).ok())
+                            .map(|emb| clust.assign(&emb))
+                    }
+                    _ => None,
+                };
+
+                tx_ui.send(AudioMessage::Transcription {
+                    text: trimmed,
+                    name: name.to_string(),
+                    speaker_id,
+                })?;
             }
         }
     }

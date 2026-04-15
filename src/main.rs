@@ -1,5 +1,6 @@
 mod data;
 mod audio;
+mod diarize;
 mod ui;
 mod video;
 mod system_audio;
