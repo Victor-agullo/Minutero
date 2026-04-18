@@ -34,26 +34,36 @@ pub fn video_transcription_thread(
 
     let mut diarize_engine: Option<DiarizeEngine> = if diarize_config.enabled {
         let _ = tx.send(VideoMessage::Status("Verificando modelo de diarización...".into()));
+        // Emitir estado inicial persistente (se sobreescribirá solo si hay éxito)
+        let _ = tx.send(VideoMessage::DiarizeWarning("⏳ Cargando motor de diarización...".into()));
+
         match Runtime::new()?.block_on(download_diarize_model(DEFAULT_DIARIZE_MODEL_URL)) {
-            Ok(diarize_path) => match DiarizeEngine::new(&diarize_path) {
-                Ok(engine) => Some(engine),
-                Err(e) => {
-                    let _ = tx.send(VideoMessage::Status(format!(
-                        "⚠️ No se pudo cargar modelo de diarización: {:?}. Continuando sin diarización.",
-                        e
-                    )));
-                    None
+            Ok(diarize_path) => {
+                eprintln!("[diarize] Modelo descargado/encontrado en: {}", diarize_path);
+                match DiarizeEngine::new(&diarize_path) {
+                    Ok(engine) => {
+                        eprintln!("[diarize] Motor cargado OK");
+                        Some(engine)
+                    }
+                    Err(e) => {
+                        eprintln!("[diarize] ERROR al cargar motor: {:?}", e);
+                        let _ = tx.send(VideoMessage::DiarizeWarning(format!(
+                            "⚠️ No se pudo cargar el modelo ONNX: {e:?}"
+                        )));
+                        None
+                    }
                 }
-            },
+            }
             Err(e) => {
-                let _ = tx.send(VideoMessage::Status(format!(
-                    "⚠️ No se pudo descargar modelo de diarización: {:?}. Continuando sin diarización.",
-                    e
+                eprintln!("[diarize] ERROR descargando modelo: {:?}", e);
+                let _ = tx.send(VideoMessage::DiarizeWarning(format!(
+                    "⚠️ No se pudo descargar el modelo de diarización: {e:?}"
                 )));
                 None
             }
         }
     } else {
+        let _ = tx.send(VideoMessage::DiarizeWarning("ℹ️ Diarización desactivada.".into()));
         None
     };
 
@@ -109,8 +119,8 @@ pub fn video_transcription_thread(
         match engine.extract_windowed_embeddings(&audio, DIARIZE_WINDOW_SECS, DIARIZE_OVERLAP_RATIO) {
             Ok((timestamps, embeddings)) => {
                 if embeddings.is_empty() {
-                    let _ = tx.send(VideoMessage::Status(
-                        "⚠️ No se pudieron extraer embeddings. Continuando sin diarización.".into()
+                    let _ = tx.send(VideoMessage::DiarizeWarning(
+                        "⚠️ No se pudieron extraer embeddings. Diarización desactivada.".into()
                     ));
                     None
                 } else {
@@ -143,16 +153,18 @@ pub fn video_transcription_thread(
                         total_duration: total_secs,
                     });
 
-                    let _ = tx.send(VideoMessage::Status(format!(
-                        "✅ {} hablantes detectados. Transcribiendo...", num_speakers
+                    // DiarizeWarning persiste aunque Whisper sobreescriba el Status.
+                    let _ = tx.send(VideoMessage::DiarizeWarning(format!(
+                        "✅ Diarización: {} hablante(s) detectado(s)", num_speakers
                     )));
+                    let _ = tx.send(VideoMessage::Status("Transcribiendo...".into()));
 
                     Some((timestamps, labels))
                 }
             }
             Err(e) => {
-                let _ = tx.send(VideoMessage::Status(format!(
-                    "⚠️ Error en diarización: {:?}. Continuando sin speaker labels.", e
+                let _ = tx.send(VideoMessage::DiarizeWarning(format!(
+                    "⚠️ Diarización falló: {:?}", e
                 )));
                 None
             }
@@ -165,7 +177,9 @@ pub fn video_transcription_thread(
 
     // ── 4. Cargar Whisper ──────────────────────────────────────────────────
     let _ = tx.send(VideoMessage::Status("Cargando modelo Whisper...".into()));
-    let ctx = WhisperContext::new_with_params(&model_path, Default::default())
+    let mut ctx_params = whisper_rs::WhisperContextParameters::default();
+    ctx_params.use_gpu = true;   // Usa GPU si el binario fue compilado con CUDA/Metal/OpenCL
+    let ctx = WhisperContext::new_with_params(&model_path, ctx_params)
         .map_err(|e| anyhow!("Error cargando modelo: {:?}", e))?;
     let mut state = ctx.create_state()
         .map_err(|e| anyhow!("Error creando estado: {:?}", e))?;
@@ -174,7 +188,6 @@ pub fn video_transcription_thread(
     let chunk_samples = (WHISPER_SAMPLE_RATE * VIDEO_CHUNK_SECS) as usize;
     let starts: Vec<usize> = (0..total_samples).step_by(chunk_samples).collect();
     let total_chunks = starts.len();
-    let mut segment_idx: usize = 0;
 
     // Progreso: 0.10–1.0 para Whisper (0.0–0.10 fue diarización)
     let progress_base = if diarize_engine.is_some() { 0.10 } else { 0.0 };
@@ -237,8 +250,15 @@ pub fn video_transcription_thread(
                             )
                         });
 
+                        // Debug: imprimir estado de diarización en el primer segmento
+                        if chunk_idx == 0 && i == 0 {
+                            eprintln!(
+                                "[video] diarize_result={}, speaker_id={:?}, seg_t={:.1}s",
+                                diarize_result.is_some(), speaker_id, seg_start_secs
+                            );
+                        }
+
                         let _ = tx.send(VideoMessage::Segment {
-                            idx: segment_idx,
                             timestamp: format_timestamp(seg_start_secs),
                             time_secs: seg_start_secs,
                             duration_secs,
@@ -246,7 +266,6 @@ pub fn video_transcription_thread(
                             speaker_id,
                         });
 
-                        segment_idx += 1;
                     }
                 }
             }

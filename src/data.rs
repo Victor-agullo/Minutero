@@ -158,8 +158,10 @@ pub struct TranscriptSegment {
     /// Marca de tiempo formateada ("00:15", "01:23:45").
     pub timestamp: String,
     /// Tiempo de inicio en segundos (para timeline).
+    #[allow(dead_code)]
     pub time_secs: f64,
     /// Duración estimada en segundos.
+    #[allow(dead_code)]
     pub duration_secs: f64,
     /// Texto transcrito.
     pub text: String,
@@ -195,7 +197,6 @@ pub enum VideoMessage {
     Progress(f32),
     /// Segmento transcrito con speaker asignado.
     Segment {
-        idx: usize,
         timestamp: String,
         time_secs: f64,
         duration_secs: f64,
@@ -210,6 +211,8 @@ pub enum VideoMessage {
     },
     Done,
     Error(String),
+    /// Aviso de diarización — se muestra persistentemente, no lo sobreescribe el progreso de Whisper.
+    DiarizeWarning(String),
 }
 
 // ── Navegación ────────────────────────────────────────────────────────────

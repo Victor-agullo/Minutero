@@ -57,6 +57,8 @@ pub struct TranscriptorApp {
     /// Timeline de diarización para la visualización.
     pub video_timeline: Vec<TimelineEntry>,
     pub video_total_duration: f64,
+    /// Aviso de diarización (persiste aunque Whisper sobreescriba video_status).
+    pub video_diarize_warning: String,
 }
 
 impl Default for TranscriptorApp {
@@ -92,6 +94,7 @@ impl Default for TranscriptorApp {
             video_speakers: Vec::new(),
             video_timeline: Vec::new(),
             video_total_duration: 0.0,
+            video_diarize_warning: String::new(),
         };
 
         if !app.all_input_devices.is_empty() {
@@ -141,7 +144,7 @@ impl eframe::App for TranscriptorApp {
             match msg {
                 VideoMessage::Status(s) => self.video_status = s,
                 VideoMessage::Progress(p) => self.video_progress = p,
-                VideoMessage::Segment { idx: _, timestamp, time_secs, duration_secs, text, speaker_id } => {
+                VideoMessage::Segment { timestamp, time_secs, duration_secs, text, speaker_id } => {
                     if let Some(sid) = speaker_id {
                         self.ensure_video_speaker(sid);
                     }
@@ -161,15 +164,20 @@ impl eframe::App for TranscriptorApp {
                     }
                 }
                 VideoMessage::Done => {
-                    self.video_is_running = false;
-                    self.video_status = "✅ Transcripción completada.".into();
-                    if let Err(e) = self.save_video_transcript() {
-                        self.video_status = format!("❌ Error al guardar: {:?}", e);
+                    if self.video_is_running {
+                        self.video_is_running = false;
+                        self.video_status = "✅ Transcripción completada.".into();
+                        if let Err(e) = self.save_video_transcript() {
+                            self.video_status = format!("❌ Error al guardar: {:?}", e);
+                        }
                     }
                 }
                 VideoMessage::Error(e) => {
                     self.video_is_running = false;
                     self.video_status = format!("❌ Error: {}", e);
+                }
+                VideoMessage::DiarizeWarning(w) => {
+                    self.video_diarize_warning = w;
                 }
             }
         }
@@ -424,6 +432,10 @@ impl TranscriptorApp {
                     if let Some(sig) = self.video_stop_signal.take() {
                         sig.store(true, Ordering::SeqCst);
                     }
+                    // Actualizar estado inmediatamente en la UI, sin esperar al hilo
+                    self.video_is_running = false;
+                    self.video_progress = 0.0;
+                    self.video_status = "⛔ Cancelado por el usuario.".into();
                 }
             } else if ui.add_enabled(can_start, egui::Button::new("▶ Transcribir")).clicked() {
                 self.start_video_transcription();
@@ -454,6 +466,16 @@ impl TranscriptorApp {
                 &self.video_status,
             );
         });
+
+        // Estado de diarización (persiste aunque Whisper sobreescriba el status principal)
+        if !self.video_diarize_warning.is_empty() {
+            let color = if self.video_diarize_warning.starts_with('✅') {
+                egui::Color32::from_rgb(52, 168, 83)  // verde
+            } else {
+                egui::Color32::YELLOW
+            };
+            ui.colored_label(color, &self.video_diarize_warning);
+        }
 
         // ── Speaker labels editables ──────────────────────────────────────
         if !self.video_speakers.is_empty() && !self.video_is_running {
@@ -593,6 +615,7 @@ impl TranscriptorApp {
         self.video_timeline.clear();
         self.video_progress = 0.0;
         self.video_total_duration = 0.0;
+        self.video_diarize_warning.clear();
         self.video_status = "Iniciando...".into();
     }
 
@@ -721,7 +744,7 @@ impl TranscriptorApp {
                         });
                         ui.label(
                             egui::RichText::new(
-                                "ℹ Más bajo = más speakers detectados. Rango típico: 0.55–0.70."
+                                "ℹ Más alto = más speakers detectados. Rango típico: 0.55–0.70."
                             )
                             .small()
                             .color(egui::Color32::GRAY),

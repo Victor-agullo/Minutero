@@ -31,9 +31,15 @@ use reqwest::Client;
 
 // ── Constantes ─────────────────────────────────────────────────────────────
 
-/// URL por defecto del modelo ONNX de embeddings de voz.
-/// Cambiar si usas otro modelo (3D-Speaker, TitaNet, etc.).
-pub const DEFAULT_DIARIZE_MODEL_URL: &str = "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet34-LM/resolve/main/avg_model.onnx";
+/// URL del modelo ONNX de embeddings de voz.
+/// Wespeaker ResNet293-LM — entrenado en VoxCeleb (inglés/multilingüe europeo).
+/// Mucho más preciso que el ResNet34 (~300 MB vs 45 MB).
+///
+/// Descarga manual si falla la automática:
+///   https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM/tree/main
+///   → descarga voxceleb_resnet293_LM.onnx → renombra a models/speaker_embedding.onnx
+pub const DEFAULT_DIARIZE_MODEL_URL: &str =
+    "https://huggingface.co/Wespeaker/wespeaker-voxceleb-resnet293-LM/resolve/main/voxceleb_resnet293_LM.onnx";
 pub const DIARIZE_MODEL_FILE: &str = "speaker_embedding.onnx";
 
 // Parámetros de extracción de features (estándar Kaldi/Wespeaker)
@@ -54,6 +60,10 @@ pub const DIARIZE_OVERLAP_RATIO: f64 = 0.5;
 pub const DEFAULT_COSINE_THRESHOLD: f32 = 0.60;
 /// Mínimo de muestras para extraer embedding (~1 s).
 pub const MIN_EMBEDDING_SAMPLES: usize = SAMPLE_RATE as usize;
+/// Máximo de ventanas que se pasan al clustering aglomerativo.
+/// Con n ventanas el clustering es O(n³); 1000 ventanas → ~1000M ops.
+/// Las ventanas sobrantes se reasignan por similitud coseno al centroide más cercano.
+pub const MAX_CLUSTER_WINDOWS: usize = 1000;
 
 // ── Mel-filterbank features ───────────────────────────────────────────────
 
@@ -181,16 +191,31 @@ pub fn compute_fbank(audio: &[f32]) -> Array2<f32> {
 // ── Motor de embeddings ONNX ──────────────────────────────────────────────
 
 pub struct DiarizeEngine {
-    
     session: Session,
+    /// None = todavía no determinado (se detecta en la primera llamada).
+    /// Some(true)  → el modelo espera [1, 80, T]  (Wespeaker ResNet, ECAPA…)
+    /// Some(false) → el modelo espera [1, T, 80]  (algunos exports alternativos)
+    mels_first: Option<bool>,
 }
 
 // Seguridad para uso en múltiples hilos
 unsafe impl Send for DiarizeEngine {}
 unsafe impl Sync for DiarizeEngine {}
 
+/// Ejecuta el modelo ONNX con el tensor dado y devuelve el embedding como Vec<f32>.
+/// Función libre para evitar conflictos de préstamo: toma &mut Session directamente,
+/// de modo que el préstamo termina al retornar (antes de que el llamador
+/// modifique otros campos de DiarizeEngine).
+fn onnx_run_extract(session: &mut Session, tensor: Tensor<f32>) -> Option<Vec<f32>> {
+    let outputs = session.run(ort::inputs![tensor]).ok()?;
+    let emb = outputs[0].try_extract_tensor::<f32>().ok()?;
+    Some(emb.1.iter().copied().collect())
+}
+
 impl DiarizeEngine {
     /// Carga el modelo ONNX desde disco.
+    /// El formato de entrada ([1,80,T] ó [1,T,80]) se auto-detecta
+    /// la primera vez que se llama a extract_embedding().
     pub fn new(model_path: &str) -> Result<Self> {
         let session = Session::builder()
             .map_err(|e| anyhow!("Error creando session builder: {:?}", e))?
@@ -198,11 +223,14 @@ impl DiarizeEngine {
             .map_err(|e| anyhow!("Error configurando optimización: {:?}", e))?
             .commit_from_file(model_path)
             .map_err(|e| anyhow!("Error cargando modelo diarización ONNX: {:?}", e))?;
-        Ok(Self { session })
+        Ok(Self { session, mels_first: None })
     }
 
     /// Extrae un vector de embedding de voz a partir de audio PCM 16 kHz mono.
     /// El audio debe tener al menos 1 segundo (~16 000 muestras).
+    ///
+    /// En la primera llamada auto-detecta el shape del tensor ([1,80,T] ó [1,T,80])
+    /// probando ambos y cacheando el que funcione.
     pub fn extract_embedding(&mut self, audio: &[f32]) -> Result<Vec<f32>> {
         if audio.len() < MIN_EMBEDDING_SAMPLES {
             return Err(anyhow!(
@@ -215,25 +243,53 @@ impl DiarizeEngine {
         let fbank = compute_fbank(audio);
         let (n_frames, n_mels) = fbank.dim();
 
-        // Crear tensor [1, T, 80] — usamos (shape, Vec) para evitar
-        // conflicto de versiones de ndarray entre nuestro crate y ort.
-        let (fbank_vec, _offset) = fbank.into_raw_vec_and_offset();
-        let input_tensor = Tensor::from_array(([1usize, n_frames, n_mels], fbank_vec))
-            .map_err(|e| anyhow!("Error creando tensor ONNX: {:?}", e))?;
+        // ── Fase de auto-detección (solo primera llamada) ──────────────────
+        if self.mels_first.is_none() {
+            // Intento 1: [1, 80, T]  (Wespeaker ResNet/ECAPA, la mayoría)
+            if let Ok(tensor) = Tensor::from_array(([1usize, n_mels, n_frames],
+                fbank.t().to_owned().into_raw_vec_and_offset().0))
+            {
+                // run_and_extract es una función libre que toma &mut Session
+                // y devuelve Vec<f32> ya copiado → el préstamo de session
+                // termina antes de que modifiquemos self.mels_first.
+                if let Some(emb) = onnx_run_extract(&mut self.session, tensor) {
+                    eprintln!("[diarize] Shape auto-detectado: [1, 80, T]");
+                    self.mels_first = Some(true);
+                    return Ok(emb);
+                }
+            }
+            // Intento 2: [1, T, 80]
+            if let Ok(tensor) = Tensor::from_array(([1usize, n_frames, n_mels],
+                fbank.clone().into_raw_vec_and_offset().0))
+            {
+                if let Some(emb) = onnx_run_extract(&mut self.session, tensor) {
+                    eprintln!("[diarize] Shape auto-detectado: [1, T, 80]");
+                    self.mels_first = Some(false);
+                    return Ok(emb);
+                }
+            }
+            return Err(anyhow!(
+                "El modelo ONNX rechazó ambos shapes de entrada ([1,80,T] y [1,T,80]).                  Comprueba que el modelo sea compatible (Wespeaker ResNet/ECAPA)."
+            ));
+        }
 
-        let outputs = self.session.run(
-            ort::inputs![input_tensor]
-        ).map_err(|e| anyhow!("Error ejecutando modelo ONNX: {:?}", e))?;
+        // ── Llamadas siguientes: shape ya conocido ─────────────────────────
+        let tensor = if self.mels_first == Some(true) {
+            Tensor::from_array(([1usize, n_mels, n_frames],
+                fbank.t().to_owned().into_raw_vec_and_offset().0))
+        } else {
+            Tensor::from_array(([1usize, n_frames, n_mels],
+                fbank.into_raw_vec_and_offset().0))
+        }.map_err(|e| anyhow!("Error creando tensor ONNX: {:?}", e))?;
 
-        let embedding_tensor = outputs[0]
-            .try_extract_tensor::<f32>()
-            .map_err(|e| anyhow!("Error extrayendo tensor de salida: {:?}", e))?;
-
-        let embedding: Vec<f32> = embedding_tensor.1.iter().copied().collect();
-        Ok(embedding)
+        onnx_run_extract(&mut self.session, tensor)
+            .ok_or_else(|| anyhow!("Error ejecutando modelo ONNX o extrayendo embedding"))
     }
 
     /// Extrae embeddings para múltiples ventanas de audio.
+    /// El paso se adapta automáticamente para que el total de ventanas nunca
+    /// supere MAX_CLUSTER_WINDOWS, evitando el submuestreo posterior y
+    /// manteniendo el clustering aglomerativo exacto sobre las ventanas reales.
     /// Devuelve (timestamps_secs, embeddings).
     pub fn extract_windowed_embeddings(
         &mut self,
@@ -242,30 +298,42 @@ impl DiarizeEngine {
         overlap_ratio: f64,
     ) -> Result<(Vec<f64>, Vec<Vec<f32>>)> {
         let window_samples = (window_secs * SAMPLE_RATE as f64) as usize;
-        let step_samples = ((1.0 - overlap_ratio) * window_samples as f64) as usize;
         let total = audio.len();
+
+        // Calcular cuántas ventanas produciría el paso por defecto
+        let default_step = ((1.0 - overlap_ratio) * window_samples as f64) as usize;
+        let default_count = if total > window_samples {
+            (total - window_samples) / default_step + 1
+        } else { 1 };
+
+        // Si hay demasiadas, ampliar el paso para quedarnos en MAX_CLUSTER_WINDOWS
+        let step_samples = if default_count > MAX_CLUSTER_WINDOWS {
+            (total as f64 / MAX_CLUSTER_WINDOWS as f64) as usize
+        } else {
+            default_step
+        };
+
+        eprintln!(
+            "[diarize] Audio {:.1}s → {} ventanas (paso {:.1}s)",
+            total as f64 / SAMPLE_RATE as f64,
+            default_count.min(MAX_CLUSTER_WINDOWS),
+            step_samples as f64 / SAMPLE_RATE as f64,
+        );
 
         let mut timestamps = Vec::new();
         let mut embeddings = Vec::new();
-
         let mut start = 0;
+
         while start < total {
             let end = (start + window_samples).min(total);
-            if end - start < MIN_EMBEDDING_SAMPLES {
-                break;
-            }
+            if end - start < MIN_EMBEDDING_SAMPLES { break; }
 
             let chunk = &audio[start..end];
             let time_secs = start as f64 / SAMPLE_RATE as f64;
 
             match self.extract_embedding(chunk) {
-                Ok(emb) => {
-                    timestamps.push(time_secs);
-                    embeddings.push(emb);
-                }
-                Err(e) => {
-                    eprintln!("Embedding fallido en t={:.1}s: {:?}", time_secs, e);
-                }
+                Ok(emb) => { timestamps.push(time_secs); embeddings.push(emb); }
+                Err(e) => { eprintln!("Embedding fallido en t={:.1}s: {:?}", time_secs, e); }
             }
 
             start += step_samples;
@@ -294,6 +362,10 @@ pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
 /// - `threshold`: similitud coseno mínima para fusionar (0.55 – 0.70 típico).
 /// - `max_speakers`: si es `Some(n)`, detiene el clustering al llegar a n clusters.
 ///
+/// Para vídeos largos (> MAX_CLUSTER_WINDOWS ventanas) submuestrea antes de
+/// agrupar y luego reasigna el resto por similitud al centroide más cercano.
+/// Esto reduce la complejidad de O(n³) a O(MAX_CLUSTER_WINDOWS³ + n·k).
+///
 /// Devuelve un vector de etiquetas (0, 1, 2…) del mismo tamaño que `embeddings`.
 pub fn agglomerative_cluster(
     embeddings: &[Vec<f32>],
@@ -301,42 +373,45 @@ pub fn agglomerative_cluster(
     max_speakers: Option<usize>,
 ) -> Vec<usize> {
     let n = embeddings.len();
-    if n == 0 {
-        return vec![];
-    }
-    if n == 1 {
-        return vec![0];
-    }
+    if n == 0 { return vec![]; }
+    if n == 1 { return vec![0]; }
 
-    let mut labels: Vec<usize> = (0..n).collect();
-    let mut centroids: Vec<Vec<f32>> = embeddings.to_vec();
-    let mut sizes: Vec<f32> = vec![1.0; n];
-    let mut active: Vec<bool> = vec![true; n];
+    // ── Submuestreo si hay demasiadas ventanas ────────────────────────────
+    let (sample_indices, sample_embeddings): (Vec<usize>, Vec<Vec<f32>>) =
+        if n > MAX_CLUSTER_WINDOWS {
+            let step = n as f64 / MAX_CLUSTER_WINDOWS as f64;
+            let idx: Vec<usize> = (0..MAX_CLUSTER_WINDOWS)
+                .map(|i| ((i as f64 * step) as usize).min(n - 1))
+                .collect();
+            let emb = idx.iter().map(|&i| embeddings[i].clone()).collect();
+            (idx, emb)
+        } else {
+            ((0..n).collect(), embeddings.to_vec())
+        };
+
+    let m = sample_embeddings.len();
+
+    // ── Clustering aglomerativo sobre la muestra ──────────────────────────
+    let mut labels: Vec<usize> = (0..m).collect();
+    let mut centroids: Vec<Vec<f32>> = sample_embeddings.clone();
+    let mut sizes: Vec<f32> = vec![1.0; m];
+    let mut active: Vec<bool> = vec![true; m];
 
     loop {
         let n_active = active.iter().filter(|&&a| a).count();
-        if n_active <= 1 {
-            break;
-        }
+        if n_active <= 1 { break; }
         if let Some(max) = max_speakers {
-            if n_active <= max {
-                break;
-            }
+            if n_active <= max { break; }
         }
 
-        // Encontrar par más similar
         let mut best_sim = f32::NEG_INFINITY;
         let mut best_i = 0;
         let mut best_j = 0;
 
-        for i in 0..n {
-            if !active[i] {
-                continue;
-            }
-            for j in (i + 1)..n {
-                if !active[j] {
-                    continue;
-                }
+        for i in 0..m {
+            if !active[i] { continue; }
+            for j in (i + 1)..m {
+                if !active[j] { continue; }
                 let sim = cosine_similarity(&centroids[i], &centroids[j]);
                 if sim > best_sim {
                     best_sim = sim;
@@ -346,37 +421,73 @@ pub fn agglomerative_cluster(
             }
         }
 
-        if best_sim < threshold {
-            break;
-        }
+        if best_sim < threshold { break; }
 
-        // Fusionar j en i (centroide ponderado por tamaño)
         let si = sizes[best_i];
         let sj = sizes[best_j];
         let total = si + sj;
         for k in 0..centroids[best_i].len() {
-            centroids[best_i][k] = (centroids[best_i][k] * si + centroids[best_j][k] * sj) / total;
+            centroids[best_i][k] =
+                (centroids[best_i][k] * si + centroids[best_j][k] * sj) / total;
         }
         sizes[best_i] = total;
         active[best_j] = false;
-
-        // Actualizar etiquetas
         let old_label = best_j;
-        for label in labels.iter_mut() {
-            if *label == old_label {
-                *label = best_i;
-            }
+        for l in labels.iter_mut() {
+            if *l == old_label { *l = best_i; }
         }
     }
 
-    // Renumerar etiquetas a 0, 1, 2…
+    // Renumerar etiquetas de la muestra a 0,1,2…
     let mut unique: Vec<usize> = labels.clone();
     unique.sort_unstable();
     unique.dedup();
-    labels
-        .iter()
+    let sample_labels: Vec<usize> = labels.iter()
         .map(|&l| unique.iter().position(|&u| u == l).unwrap_or(0))
-        .collect()
+        .collect();
+
+    // Centroides finales de cada cluster (para reasignación)
+    let n_clusters = unique.len();
+    let dim = centroids[0].len();
+    let mut final_centroids = vec![vec![0.0f32; dim]; n_clusters];
+    let mut final_counts = vec![0usize; n_clusters];
+    for (i, &cl) in sample_labels.iter().enumerate() {
+        for (d, v) in final_centroids[cl].iter_mut().zip(&sample_embeddings[i]) {
+            *d += v;
+        }
+        final_counts[cl] += 1;
+    }
+    for (centroid, &count) in final_centroids.iter_mut().zip(&final_counts) {
+        if count > 0 {
+            for v in centroid.iter_mut() { *v /= count as f32; }
+        }
+    }
+
+    // ── Si no hubo submuestreo, devolver ya ───────────────────────────────
+    if n == m {
+        return sample_labels;
+    }
+
+    // ── Reasignar TODAS las ventanas al centroide más cercano ─────────────
+    // Primero construir mapa índice_muestra → label
+    let mut sample_label_map = vec![0usize; n];
+    for (pos, &orig_idx) in sample_indices.iter().enumerate() {
+        sample_label_map[orig_idx] = sample_labels[pos];
+    }
+
+    let mut full_labels = vec![0usize; n];
+    for i in 0..n {
+        let best = final_centroids.iter().enumerate()
+            .max_by(|(_, a), (_, b)| {
+                cosine_similarity(&embeddings[i], a)
+                    .partial_cmp(&cosine_similarity(&embeddings[i], b))
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(idx, _)| idx)
+            .unwrap_or(0);
+        full_labels[i] = best;
+    }
+    full_labels
 }
 
 // ── Clustering incremental (real-time — audio en vivo) ────────────────────
@@ -428,6 +539,7 @@ impl IncrementalClusterer {
         }
     }
 
+    #[allow(dead_code)]
     pub fn num_speakers(&self) -> usize {
         self.centroids.len()
     }

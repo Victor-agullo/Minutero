@@ -209,7 +209,9 @@ fn run_single_stream_linux(
     use std::process::Stdio;
     use std::io::Read;
 
-    let ctx = WhisperContext::new_with_params(&model_path, Default::default())
+    let mut ctx_params = whisper_rs::WhisperContextParameters::default();
+    ctx_params.use_gpu = true;   // Usa GPU si el binario fue compilado con CUDA/Metal/OpenCL
+    let ctx = WhisperContext::new_with_params(&model_path, ctx_params)
         .map_err(|e| anyhow!("Error cargando modelo: {:?}", e))?;
     let mut state = ctx.create_state()
         .map_err(|e| anyhow!("Error creando estado: {:?}", e))?;
@@ -294,7 +296,9 @@ fn run_single_stream_cpal(
 ) -> Result<()> {
     let host = cpal::default_host();
 
-    let ctx = WhisperContext::new_with_params(&model_path, Default::default())
+    let mut ctx_params = whisper_rs::WhisperContextParameters::default();
+    ctx_params.use_gpu = true;   // Usa GPU si el binario fue compilado con CUDA/Metal/OpenCL
+    let ctx = WhisperContext::new_with_params(&model_path, ctx_params)
         .map_err(|e| anyhow!("Error cargando modelo: {:?}", e))?;
     let mut state = ctx.create_state()
         .map_err(|e| anyhow!("Error creando estado: {:?}", e))?;
