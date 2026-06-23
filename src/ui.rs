@@ -109,7 +109,8 @@ impl Default for TranscriptorApp {
 }
 
 impl eframe::App for TranscriptorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // eframe 0.34: firma corregida — recibe &mut egui::Ui en lugar de &egui::Context.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // ── Procesar mensajes de audio en tiempo real ──────────────────────
         // Recopilar mensajes primero para evitar conflicto de borrows
         let audio_msgs: Vec<AudioMessage> = self.ui_rx.as_ref()
@@ -182,8 +183,8 @@ impl eframe::App for TranscriptorApp {
             }
         }
 
-        // ── UI ─────────────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        // egui 0.34: Panel::top/central + show_inside(ui) en lugar de TopBottomPanel + show(ctx)
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.current_view, View::Transcription, "🎙 Transcripción");
                 ui.selectable_value(&mut self.current_view, View::Video, "🎬 Vídeo");
@@ -199,7 +200,7 @@ impl eframe::App for TranscriptorApp {
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             match self.current_view {
                 View::Transcription => self.transcriber_ui(ui),
                 View::Video => self.video_ui(ui),
@@ -208,10 +209,10 @@ impl eframe::App for TranscriptorApp {
         });
 
         if self.show_loopback_setup {
-            self.show_loopback_dialog(ctx);
+            self.show_loopback_dialog(ui.ctx());
         }
 
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
     }
 }
 
@@ -288,10 +289,12 @@ impl TranscriptorApp {
             ui.label("Modelo Whisper:");
             egui::ComboBox::from_label("")
                 .selected_text(&self.model_name)
-                .width(150.0)
+                .width(180.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.model_name, "medium".into(), "Medium");
-                    ui.selectable_value(&mut self.model_name, "large-v3".into(), "Large-v3");
+                    ui.selectable_value(&mut self.model_name, "small".into(),         "Small    (~150 MB, rápido)");
+                    ui.selectable_value(&mut self.model_name, "medium".into(),        "Medium   (~450 MB)");
+                    ui.selectable_value(&mut self.model_name, "large-v3-turbo".into(),"Large-v3 Turbo (~800 MB, recomendado)");
+                    ui.selectable_value(&mut self.model_name, "large-v3".into(),      "Large-v3 (~1.5 GB, máx. calidad)");
                 });
         });
 
@@ -379,10 +382,11 @@ impl TranscriptorApp {
             ui.add_enabled_ui(!self.video_is_running, |ui| {
                 if ui.button("📂 Seleccionar archivo").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "Vídeo / Audio",
-                            &["mp4", "mkv", "avi", "mov", "webm", "mp3", "wav", "flac", "ogg", "m4a"],
-                        )
+                        // Filtros separados: en Linux/GTK un único grupo con muchas
+                        // extensiones a veces no muestra todos los archivos correctamente.
+                        .add_filter("Vídeo",  &["mp4", "mkv", "avi", "mov", "webm", "m4v", "ts", "wmv"])
+                        .add_filter("Audio",  &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma", "aiff"])
+                        .add_filter("Todos los archivos", &["*"])
                         .pick_file()
                     {
                         self.video_file_path = Some(path.to_string_lossy().to_string());
@@ -416,10 +420,12 @@ impl TranscriptorApp {
             ui.add_enabled_ui(!self.video_is_running, |ui| {
                 egui::ComboBox::from_id_salt("video_model")
                     .selected_text(&self.model_name)
-                    .width(150.0)
+                    .width(180.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.model_name, "medium".into(), "Medium");
-                        ui.selectable_value(&mut self.model_name, "large-v3".into(), "Large-v3");
+                        ui.selectable_value(&mut self.model_name, "small".into(),         "Small    (~150 MB, rápido)");
+                        ui.selectable_value(&mut self.model_name, "medium".into(),        "Medium   (~450 MB)");
+                        ui.selectable_value(&mut self.model_name, "large-v3-turbo".into(),"Large-v3 Turbo (~800 MB, recomendado)");
+                        ui.selectable_value(&mut self.model_name, "large-v3".into(),      "Large-v3 (~1.5 GB, máx. calidad)");
                     });
             });
 
@@ -737,14 +743,16 @@ impl TranscriptorApp {
                         ui.horizontal(|ui| {
                             ui.label("Sensibilidad:");
                             ui.add(
-                                egui::Slider::new(&mut self.diarize_config.threshold, 0.40..=0.80)
+                                egui::Slider::new(&mut self.diarize_config.threshold, 0.50..=0.85)
                                     .text("umbral coseno")
                                     .step_by(0.05),
                             );
                         });
                         ui.label(
                             egui::RichText::new(
-                                "ℹ Más alto = más speakers detectados. Rango típico: 0.55–0.70."
+                                "ℹ Más bajo = más speakers (más sensible a diferencias).\
+                                 Más alto = menos speakers (fusiona voces parecidas).\
+                                 Rango recomendado: 0.65–0.75."
                             )
                             .small()
                             .color(egui::Color32::GRAY),

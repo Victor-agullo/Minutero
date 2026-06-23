@@ -12,9 +12,9 @@ use crate::data::{
     VideoMessage, WHISPER_SAMPLE_RATE,
 };
 use crate::diarize::{
-    agglomerative_cluster, download_diarize_model, lookup_speaker,
+    agglomerative_cluster, compute_optimal_window_secs, download_diarize_model, lookup_speaker,
     DiarizeEngine, DEFAULT_DIARIZE_MODEL_URL,
-    DIARIZE_OVERLAP_RATIO, DIARIZE_WINDOW_SECS,
+    DIARIZE_OVERLAP_RATIO,
 };
 
 /// Chunks de 30 segundos — ventana nativa de Whisper, calidad óptima.
@@ -29,15 +29,17 @@ pub fn video_transcription_thread(
     stop_signal: Arc<AtomicBool>,
 ) -> Result<()> {
     // ── 1. Descargar modelos ───────────────────────────────────────────────
+    // Un único runtime para todas las operaciones async del hilo
+    let rt = Runtime::new()?;
+
     let _ = tx.send(VideoMessage::Status("Verificando modelo Whisper...".into()));
-    let model_path = Runtime::new()?.block_on(download_whisper_model(&model_name))?;
+    let model_path = rt.block_on(download_whisper_model(&model_name))?;
 
     let mut diarize_engine: Option<DiarizeEngine> = if diarize_config.enabled {
         let _ = tx.send(VideoMessage::Status("Verificando modelo de diarización...".into()));
-        // Emitir estado inicial persistente (se sobreescribirá solo si hay éxito)
         let _ = tx.send(VideoMessage::DiarizeWarning("⏳ Cargando motor de diarización...".into()));
 
-        match Runtime::new()?.block_on(download_diarize_model(DEFAULT_DIARIZE_MODEL_URL)) {
+        match rt.block_on(download_diarize_model(DEFAULT_DIARIZE_MODEL_URL)) {
             Ok(diarize_path) => {
                 eprintln!("[diarize] Modelo descargado/encontrado en: {}", diarize_path);
                 match DiarizeEngine::new(&diarize_path) {
@@ -70,6 +72,15 @@ pub fn video_transcription_thread(
     // ── 2. Extraer audio con ffmpeg ────────────────────────────────────────
     let _ = tx.send(VideoMessage::Status("Extrayendo audio con ffmpeg...".into()));
 
+    // Verificar que el archivo existe antes de lanzar ffmpeg
+    if !std::path::Path::new(&file_path).exists() {
+        return Err(anyhow!(
+            "Archivo no encontrado: {}\n\
+             Comprueba que la ruta es correcta y el archivo sigue accesible.",
+            file_path
+        ));
+    }
+
     let mut child = Command::new("ffmpeg")
         .args(&[
             "-i", &file_path,
@@ -80,19 +91,46 @@ pub fn video_transcription_thread(
             "pipe:1",
         ])
         .stdout(Stdio::piped())
-        .stderr(Stdio::null())
+        .stderr(Stdio::piped())   // Capturar en lugar de descartar
         .spawn()
-        .map_err(|e| anyhow!("Error iniciando ffmpeg: {:?}\n¿Está ffmpeg instalado?", e))?;
+        .map_err(|e| anyhow!(
+            "No se pudo iniciar ffmpeg: {:?}\n\
+             ¿Está instalado? En Linux: sudo apt install ffmpeg\n\
+             En macOS: brew install ffmpeg\n\
+             En Windows: https://ffmpeg.org/download.html",
+            e
+        ))?;
 
     let mut stdout = child.stdout.take()
         .ok_or_else(|| anyhow!("No se pudo obtener stdout de ffmpeg"))?;
+    let mut stderr_handle = child.stderr.take();
 
     let mut audio_bytes = Vec::new();
     stdout.read_to_end(&mut audio_bytes)?;
-    let _ = child.wait();
+    let status = child.wait()?;
 
-    if audio_bytes.is_empty() {
-        return Err(anyhow!("ffmpeg no produjo audio. ¿Es un archivo de vídeo/audio válido?"));
+    if !status.success() || audio_bytes.is_empty() {
+        // Leer stderr para incluir el error real de ffmpeg en el mensaje
+        let ffmpeg_error = stderr_handle
+            .as_mut()
+            .and_then(|s| {
+                let mut buf = String::new();
+                s.read_to_string(&mut buf).ok()?;
+                // Devolver solo las últimas líneas relevantes (ffmpeg es muy verbose)
+                let lines: Vec<&str> = buf.lines()
+                    .filter(|l| l.contains("Error") || l.contains("Invalid") || l.contains("No such"))
+                    .collect();
+                if lines.is_empty() { None } else { Some(lines.join("\n")) }
+            })
+            .unwrap_or_else(|| "Sin detalle de error disponible".into());
+
+        return Err(anyhow!(
+            "ffmpeg no pudo procesar el archivo.\n\
+             Archivo: {}\n\
+             Código de salida: {:?}\n\
+             Error: {}",
+            file_path, status.code(), ffmpeg_error
+        ));
     }
 
     let audio: Vec<f32> = audio_bytes
@@ -111,12 +149,20 @@ pub fn video_transcription_thread(
 
     if stop_signal.load(Ordering::SeqCst) { return Ok(()); }
 
+    // Calcular ventana de diarización óptima según la RAM disponible.
+    // Se hace aquí — fuera del bloque de diarización — porque el mismo valor
+    // se necesita después en lookup_speaker durante el loop de Whisper.
+    let diarize_window_secs = compute_optimal_window_secs();
+
     // ── 3. Diarización (si está habilitada) ────────────────────────────────
     let diarize_result: Option<(Vec<f64>, Vec<usize>)> = if let Some(ref mut engine) = diarize_engine {
         let _ = tx.send(VideoMessage::Status("Analizando hablantes...".into()));
         let _ = tx.send(VideoMessage::Progress(0.01));
+        let _ = tx.send(VideoMessage::DiarizeWarning(format!(
+            "⏳ Analizando voces (ventana: {:.0} s)...", diarize_window_secs
+        )));
 
-        match engine.extract_windowed_embeddings(&audio, DIARIZE_WINDOW_SECS, DIARIZE_OVERLAP_RATIO) {
+        match engine.extract_windowed_embeddings(&audio, diarize_window_secs, DIARIZE_OVERLAP_RATIO) {
             Ok((timestamps, embeddings)) => {
                 if embeddings.is_empty() {
                     let _ = tx.send(VideoMessage::DiarizeWarning(
@@ -138,11 +184,10 @@ pub fn video_transcription_thread(
                     let num_speakers = labels.iter().copied().max().map(|m| m + 1).unwrap_or(0);
 
                     // Construir timeline
-                    let window_duration = DIARIZE_WINDOW_SECS;
                     let entries: Vec<TimelineEntry> = timestamps.iter().zip(labels.iter())
                         .map(|(&t, &speaker_id)| TimelineEntry {
                             start_secs: t,
-                            end_secs: (t + window_duration).min(total_secs),
+                            end_secs: (t + diarize_window_secs).min(total_secs),
                             speaker_id,
                         })
                         .collect();
@@ -231,14 +276,13 @@ pub fn video_transcription_thread(
                             continue;
                         }
 
-                        // Estimar timestamps del segmento Whisper dentro del chunk.
-                        // whisper-rs 0.16 no expone t0/t1 directamente; estimamos
-                        // distribuyendo los segmentos uniformemente en el chunk.
-                        let n_segs = n as f64;
-                        let chunk_duration = (chunk_end - chunk_start) as f64 / WHISPER_SAMPLE_RATE as f64;
-                        let seg_duration = chunk_duration / n_segs.max(1.0);
-                        let seg_start_secs = time_offset_secs + (i as f64 * seg_duration);
-                        let duration_secs = seg_duration.max(0.5);
+                        // whisper-rs 0.16: los timestamps están en WhisperSegment,
+                        // no en WhisperState. Los valores están en centisegundos
+                        // relativos al inicio del chunk, no del archivo completo.
+                        let t0_cs = segment.start_timestamp();
+                        let t1_cs = segment.end_timestamp();
+                        let seg_start_secs = time_offset_secs + (t0_cs as f64 / 100.0);
+                        let duration_secs = ((t1_cs - t0_cs) as f64 / 100.0).max(0.1);
 
                         // Buscar speaker en la timeline de diarización
                         let speaker_id = diarize_result.as_ref().and_then(|(timestamps, labels)| {
@@ -246,7 +290,7 @@ pub fn video_transcription_thread(
                                 seg_start_secs,
                                 timestamps,
                                 labels,
-                                DIARIZE_WINDOW_SECS,
+                                diarize_window_secs,
                             )
                         });
 

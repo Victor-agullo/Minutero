@@ -1,24 +1,25 @@
 [package]
 name = "transcriptor"
 version = "0.3.0"
-edition = "2021"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = "0.4.44"
-cpal = "0.17.3"
-eframe = "0.33.3"
-egui = "0.33.3"
+chrono = "0.4.45"
+cpal = "0.18.1"
+eframe = "0.34.3"
+egui = "0.34.3"
 futures-util = "0.3.32"
-ndarray = "0.16"
+ndarray = "0.17.2"
 num-traits = "0.2.19"
 ort = { version = "2.0.0-rc.12", default-features = true }
-rubato = "1.0.1"
-reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "stream"] }
-rfd = "0.17.*"
-rustfft = "6.2"
-tokio = { version = "1.50.0", features = ["full"] }
+rubato = "3.0.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+rfd = "0.17.2"
+rustfft = "6.4.1"
+tokio = { version = "1.52.3", features = ["full"] }
 whisper-rs = { version = "0.16.0" }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [features]
 # ── Aceleración por GPU ────────────────────────────────────────────────────
@@ -36,6 +37,3 @@ metal     = ["whisper-rs/metal", "whisper-rs/coreml", "ort/coreml"]
 
 # Windows AMD + Intel — DirectML (Whisper via CMAKE_ARGS, Diarización via ort)
 directml  = ["ort/directml"]
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.185"

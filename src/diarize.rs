@@ -25,6 +25,7 @@ use ort::value::Tensor;
 use rustfft::{FftPlanner, num_complex::Complex};
 use std::io::Write;
 use std::path::Path;
+use sysinfo::System;
 
 use futures_util::StreamExt;
 use reqwest::Client;
@@ -52,12 +53,13 @@ const MEL_LOW_FREQ: f32 = 20.0;
 const MEL_HIGH_FREQ: f32 = 0.0; // 0 = Nyquist (8000 Hz @ 16 kHz)
 const SAMPLE_RATE: u32 = 16000;
 
-/// Ventana de diarización: 3 s por fragmento.
-pub const DIARIZE_WINDOW_SECS: f64 = 3.0;
-/// Solapamiento 50 % (1.5 s).
+/// Solapamiento 50 % (paso de 2.5 s entre ventanas).
 pub const DIARIZE_OVERLAP_RATIO: f64 = 0.5;
 /// Umbral de similitud coseno por defecto para auto-detección.
-pub const DEFAULT_COSINE_THRESHOLD: f32 = 0.60;
+/// 0.70 es más conservador: fusiona más antes de crear un speaker nuevo,
+/// lo que da mejores resultados en reuniones con voces similares o ruido de fondo.
+/// El usuario puede bajarlo a 0.55–0.65 si hay hablantes con voces muy parecidas.
+pub const DEFAULT_COSINE_THRESHOLD: f32 = 0.70;
 /// Mínimo de muestras para extraer embedding (~1 s).
 pub const MIN_EMBEDDING_SAMPLES: usize = SAMPLE_RATE as usize;
 /// Máximo de ventanas que se pasan al clustering aglomerativo.
@@ -65,7 +67,64 @@ pub const MIN_EMBEDDING_SAMPLES: usize = SAMPLE_RATE as usize;
 /// Las ventanas sobrantes se reasignan por similitud coseno al centroide más cercano.
 pub const MAX_CLUSTER_WINDOWS: usize = 1000;
 
-// ── Mel-filterbank features ───────────────────────────────────────────────
+// ── Cálculo dinámico de ventana óptima ────────────────────────────────────
+
+/// Detecta la RAM disponible y devuelve el tamaño de ventana de diarización
+/// óptimo para este sistema.
+///
+/// ## Coste RAM por segundo de ventana
+/// | Componente            | Cálculo                     | KB/s |
+/// |-----------------------|-----------------------------|------|
+/// | Audio PCM f32         | 16 000 muestras × 4 bytes   |  64  |
+/// | Mel fbank \[T × 80\]  | 100 frames × 80 bins × 4    |  32  |
+/// | Tensor ONNX (copia)   | ídem fbank                  |  32  |
+/// | **Total RAM**         |                             | **128** |
+///
+/// Las activaciones intermedias del modelo ResNet (~400 KB/s) viven en VRAM,
+/// no en RAM del proceso, y su impacto es < 5 MB incluso para ventanas de 30 s.
+///
+/// ## Fórmula
+/// `ventana = (RAM_usable_MB × 1024 × 0.001) / 128`  → acotada a \[4 s, 15 s\]
+///
+/// Se usa el 0.1 % de la RAM disponible como presupuesto. Esto hace que el
+/// límite de RAM sea vinculante solo para sistemas con < 1.9 GB disponibles;
+/// en sistemas más holgados la cota de calidad (15 s) es la que domina.
+///
+/// ## ¿Por qué 15 s como máximo?
+/// Por encima de ~15 s hay riesgo de capturar dos hablantes distintos en la
+/// misma ventana, lo que promedia sus voces y degrada el clustering.
+pub fn compute_optimal_window_secs() -> f64 {
+    let mut sys = System::new();
+    sys.refresh_memory();
+
+    let total_mb   = sys.total_memory()     / 1_048_576; // bytes → MB
+    let avail_mb   = sys.available_memory() / 1_048_576;
+
+    // available_memory() devuelve 0 en algunos SO/entornos; en ese caso
+    // usamos el 50 % de la RAM total como estimación conservadora.
+    let usable_mb = if avail_mb > 64 { avail_mb } else { total_mb / 2 };
+
+    eprintln!(
+        "[diarize] RAM del sistema: {} MB total / {} MB disponible → {} MB usables",
+        total_mb, avail_mb, usable_mb
+    );
+
+    const RAM_PER_SEC_KB:  f64 = 128.0; // KB de RAM por segundo de ventana
+    const BUDGET_FRACTION: f64 = 0.001; // 0.1 % de la RAM disponible
+
+    let budget_kb  = usable_mb as f64 * 1024.0 * BUDGET_FRACTION;
+    let window_raw = budget_kb / RAM_PER_SEC_KB;
+    let window     = window_raw.clamp(4.0, 15.0);
+
+    eprintln!(
+        "[diarize] Ventana calculada: {:.1} s  (sin acotar: {:.0} s, rango: 4–15 s)",
+        window, window_raw
+    );
+
+    window
+}
+
+
 
 fn pre_emphasis(signal: &[f32]) -> Vec<f32> {
     let mut out = Vec::with_capacity(signal.len());
@@ -178,7 +237,14 @@ pub fn compute_fbank(audio: &[f32]) -> Array2<f32> {
         }
     }
 
-    // CMVN: normalización de media cepstral
+    // CMVN: solo sustracción de media (utterance-level mean normalization).
+    //
+    // El modelo Wespeaker ResNet293-LM fue entrenado con media-only CMVN:
+    //   feat = feat - feat.mean(dim=0)
+    //
+    // NO aplicar normalización de varianza: las diferencias de energía por
+    // banda mel (fuerza de formantes, timbre vocal) son información clave
+    // para distinguir hablantes. Normalizar la varianza la destruye.
     if let Some(mean) = fbank.mean_axis(Axis(0)) {
         for mut row in fbank.rows_mut() {
             row -= &mean;
@@ -244,32 +310,38 @@ impl DiarizeEngine {
         let (n_frames, n_mels) = fbank.dim();
 
         // ── Fase de auto-detección (solo primera llamada) ──────────────────
+        //
+        // ORDEN IMPORTANTE:
+        // El modelo Wespeaker ResNet293-LM fue exportado con input [1, T, 80]
+        // (batch, tiempo, mels). Si el modelo tiene dims completamente dinámicas,
+        // ORT puede aceptar [1, 80, T] sin error pero producir embeddings basura
+        // (interpreta 80 frames de 500 bins en lugar de 500 frames de 80 bins).
+        // Por eso probamos primero el formato correcto de Wespeaker.
         if self.mels_first.is_none() {
-            // Intento 1: [1, 80, T]  (Wespeaker ResNet/ECAPA, la mayoría)
-            if let Ok(tensor) = Tensor::from_array(([1usize, n_mels, n_frames],
-                fbank.t().to_owned().into_raw_vec_and_offset().0))
-            {
-                // run_and_extract es una función libre que toma &mut Session
-                // y devuelve Vec<f32> ya copiado → el préstamo de session
-                // termina antes de que modifiquemos self.mels_first.
-                if let Some(emb) = onnx_run_extract(&mut self.session, tensor) {
-                    eprintln!("[diarize] Shape auto-detectado: [1, 80, T]");
-                    self.mels_first = Some(true);
-                    return Ok(emb);
-                }
-            }
-            // Intento 2: [1, T, 80]
+            // Intento 1: [1, T, 80] — formato estándar Wespeaker ResNet/ECAPA
             if let Ok(tensor) = Tensor::from_array(([1usize, n_frames, n_mels],
                 fbank.clone().into_raw_vec_and_offset().0))
             {
                 if let Some(emb) = onnx_run_extract(&mut self.session, tensor) {
-                    eprintln!("[diarize] Shape auto-detectado: [1, T, 80]");
+                    eprintln!("[diarize] Shape auto-detectado: [1, T, 80] (Wespeaker estándar)");
                     self.mels_first = Some(false);
-                    return Ok(emb);
+                    return Ok(l2_normalize_vec(emb));
+                }
+            }
+            // Intento 2: [1, 80, T] — algunos exports alternativos o ECAPA canales-primero
+            if let Ok(tensor) = Tensor::from_array(([1usize, n_mels, n_frames],
+                fbank.t().to_owned().into_raw_vec_and_offset().0))
+            {
+                if let Some(emb) = onnx_run_extract(&mut self.session, tensor) {
+                    eprintln!("[diarize] Shape auto-detectado: [1, 80, T] (canales-primero)");
+                    self.mels_first = Some(true);
+                    return Ok(l2_normalize_vec(emb));
                 }
             }
             return Err(anyhow!(
-                "El modelo ONNX rechazó ambos shapes de entrada ([1,80,T] y [1,T,80]).                  Comprueba que el modelo sea compatible (Wespeaker ResNet/ECAPA)."
+                "El modelo ONNX rechazó ambos shapes ([1,T,80] y [1,80,T]).\n\
+                 Comprueba que el modelo sea compatible (Wespeaker ResNet/ECAPA).\n\
+                 Puedes inspeccionar el shape esperado abriendo el .onnx en https://netron.app"
             ));
         }
 
@@ -283,6 +355,7 @@ impl DiarizeEngine {
         }.map_err(|e| anyhow!("Error creando tensor ONNX: {:?}", e))?;
 
         onnx_run_extract(&mut self.session, tensor)
+            .map(l2_normalize_vec)
             .ok_or_else(|| anyhow!("Error ejecutando modelo ONNX o extrayendo embedding"))
     }
 
@@ -343,6 +416,43 @@ impl DiarizeEngine {
     }
 }
 
+// ── Normalización L2 ─────────────────────────────────────────────────────
+
+/// Normaliza un vector a norma L2 = 1.
+/// Con embeddings en la esfera unitaria, la similitud coseno es equivalente
+/// al producto escalar y los centroides del clustering son más estables
+/// (el promedio de vectores unitarios converge al "centro geométrico" del hablante).
+fn l2_normalize_vec(mut v: Vec<f32>) -> Vec<f32> {
+    let norm: f32 = v.iter().map(|x| x * x).sum::<f32>().sqrt();
+    if norm > 1e-8 {
+        for x in v.iter_mut() { *x /= norm; }
+    }
+    v
+}
+
+// ── Suavizado temporal de etiquetas ───────────────────────────────────────
+
+/// Aplica voto mayoritario sobre ventanas de `2*half_window + 1` elementos.
+/// Elimina "flickers": ventanas aisladas asignadas a un speaker incorrecto
+/// por ruido puntual o por fragmentos de audio en transiciones.
+fn smooth_speaker_labels(labels: &[usize], half_window: usize) -> Vec<usize> {
+    let n = labels.len();
+    if n <= 1 || half_window == 0 { return labels.to_vec(); }
+
+    labels.iter().enumerate().map(|(i, _)| {
+        let start = i.saturating_sub(half_window);
+        let end  = (i + half_window + 1).min(n);
+        let mut counts = std::collections::HashMap::<usize, usize>::new();
+        for &l in &labels[start..end] {
+            *counts.entry(l).or_insert(0) += 1;
+        }
+        counts.into_iter()
+            .max_by_key(|(_, c)| *c)
+            .map(|(l, _)| l)
+            .unwrap_or(labels[i])
+    }).collect()
+}
+
 // ── Similitud coseno ──────────────────────────────────────────────────────
 
 pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
@@ -375,6 +485,36 @@ pub fn agglomerative_cluster(
     let n = embeddings.len();
     if n == 0 { return vec![]; }
     if n == 1 { return vec![0]; }
+
+    // ── Diagnóstico: distribución de similitudes pairwise ─────────────────
+    // Inspecciona las primeras min(n, 30) ventanas para no impactar el tiempo.
+    // Interpreta la salida en stderr:
+    //   mean > 0.92 → embeddings no discriminativos: problema en features o shape de tensor
+    //   mean 0.60–0.90 → embeddings OK; ajustar umbral o usar modo manual
+    //   mean < 0.60 → embeddings muy dispersos; posible ruido excesivo o audio muy corto
+    {
+        let probe = n.min(30);
+        let mut sims: Vec<f32> = Vec::with_capacity(probe * (probe - 1) / 2);
+        for i in 0..probe {
+            for j in (i + 1)..probe {
+                sims.push(cosine_similarity(&embeddings[i], &embeddings[j]));
+            }
+        }
+        if !sims.is_empty() {
+            let mean = sims.iter().sum::<f32>() / sims.len() as f32;
+            let min  = sims.iter().cloned().fold(f32::INFINITY,     f32::min);
+            let max  = sims.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            eprintln!(
+                "[diarize] Similitudes coseno ({} ventanas, {} pares): \
+                 min={:.3}  mean={:.3}  max={:.3}  umbral={:.2}",
+                probe, sims.len(), min, mean, max, threshold
+            );
+            if mean > 0.92 {
+                eprintln!("[diarize] ⚠️  mean > 0.92: embeddings poco discriminativos. \
+                           Revisar shape del tensor (ver log '[diarize] Shape auto-detectado').");
+            }
+        }
+    }
 
     // ── Submuestreo si hay demasiadas ventanas ────────────────────────────
     let (sample_indices, sample_embeddings): (Vec<usize>, Vec<Vec<f32>>) =
@@ -463,9 +603,9 @@ pub fn agglomerative_cluster(
         }
     }
 
-    // ── Si no hubo submuestreo, devolver ya ───────────────────────────────
+    // ── Si no hubo submuestreo, aplicar suavizado y devolver ──────────────
     if n == m {
-        return sample_labels;
+        return smooth_speaker_labels(&sample_labels, 2);
     }
 
     // ── Reasignar TODAS las ventanas al centroide más cercano ─────────────
@@ -487,7 +627,7 @@ pub fn agglomerative_cluster(
             .unwrap_or(0);
         full_labels[i] = best;
     }
-    full_labels
+    smooth_speaker_labels(&full_labels, 2)
 }
 
 // ── Clustering incremental (real-time — audio en vivo) ────────────────────
@@ -497,6 +637,11 @@ pub struct IncrementalClusterer {
     counts: Vec<usize>,
     threshold: f32,
 }
+
+/// Factor de actualización del centroide (EMA).
+/// 0.10 → el centroide cambia despacio (más estable, peor si la voz cambia mucho).
+/// 0.20 → se adapta más rápido (útil en sesiones largas con ruido variable).
+const EMA_ALPHA: f32 = 0.12;
 
 impl IncrementalClusterer {
     pub fn new(threshold: f32) -> Self {
@@ -508,7 +653,10 @@ impl IncrementalClusterer {
     }
 
     /// Asigna un embedding al hablante más cercano o crea uno nuevo.
-    /// Devuelve el ID del hablante (0, 1, 2…).
+    /// El centroide se actualiza con una media exponencialmente ponderada (EMA)
+    /// en lugar de la media aritmética acumulativa, de modo que las muestras
+    /// recientes tienen más peso y el centroide no queda "congelado" en la
+    /// representación inicial del hablante.
     pub fn assign(&mut self, embedding: &[f32]) -> usize {
         let mut best_sim = f32::NEG_INFINITY;
         let mut best_idx = 0;
@@ -528,11 +676,9 @@ impl IncrementalClusterer {
             self.counts.push(1);
             idx
         } else {
-            // Actualizar centroide (media acumulativa)
-            let count = self.counts[best_idx] as f32;
-            let new_count = count + 1.0;
+            // Actualizar centroide con EMA: más peso a muestras recientes
             for (c, &e) in self.centroids[best_idx].iter_mut().zip(embedding) {
-                *c = (*c * count + e) / new_count;
+                *c = *c * (1.0 - EMA_ALPHA) + e * EMA_ALPHA;
             }
             self.counts[best_idx] += 1;
             best_idx

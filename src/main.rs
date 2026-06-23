@@ -10,16 +10,21 @@ use crate::ui::TranscriptorApp;
 use std::env;
 
 fn main() -> Result<()> {
-    env::set_var("ALSA_CONFIG_PATH", "/dev/null");
-
-    #[cfg(target_os = "linux")]
-    {
-        use std::fs::OpenOptions;
-        use std::os::unix::io::AsRawFd;
-        if let Ok(null) = OpenOptions::new().write(true).open("/dev/null") {
-            unsafe { libc::dup2(null.as_raw_fd(), libc::STDERR_FILENO); }
-        }
+    // Silenciar mensajes de ALSA que no son errores reales.
+    // En Rust edition 2024, env::set_var es unsafe porque puede causar UB si
+    // se llama concurrentemente desde varios hilos. Aquí es seguro: se llama
+    // al inicio de main(), antes de que se cree ningún hilo.
+    // SAFETY: single-threaded at this point — no threads exist yet.
+    unsafe {
+        env::set_var("ALSA_CONFIG_PATH", "/dev/null");
+        env::set_var("ALSA_PLUGIN_DIR", "/dev/null");
     }
+
+    // NO suprimimos stderr globalmente: eso escondía los eprintln! de depuración
+    // de diarize.rs y video.rs, haciendo imposible diagnosticar errores.
+    // Si el spam de ALSA molesta en producción, compilar con:
+    //   RUST_LOG=error cargo run --release
+    // o filtrar con: cargo run 2>&1 | grep -v ALSA
 
     let options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
