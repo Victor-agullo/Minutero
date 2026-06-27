@@ -9,6 +9,19 @@ param(
     [switch]$Force
 )
 
+
+# ── Auto-bypass si se ejecuta en una sesión restringida ────────────────────────
+# Si la política impide ejecutar scripts, re-lanza con Bypass.
+# Esto NO aplica cuando se llama desde Install.bat (que ya usa -ExecutionPolicy Bypass).
+$policy = Get-ExecutionPolicy -Scope Process
+if ($policy -notin @('Bypass','Unrestricted','RemoteSigned')) {
+    Write-Host "Reactivando con politica Bypass..." -ForegroundColor Yellow
+    Start-Process powershell -ArgumentList @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $MyInvocation.MyCommand.Path
+    ) -Wait
+    exit
+}
+
 $ErrorActionPreference = "Stop"
 $ProgressPreference    = "SilentlyContinue"
 
@@ -52,7 +65,7 @@ $gpu = @{
 }
 
 try {
-    $controllers = Get-WmiObject Win32_VideoController |
+    $controllers = Get-CimInstance Win32_VideoController |
         Where-Object { $_.Name -notmatch "Remote|Virtual|Basic|Microsoft" }
 
     foreach ($c in $controllers) {
@@ -119,7 +132,7 @@ $variantLabel   = "CPU (sin aceleración GPU)"
 
 if ($gpu.hasNvidia) {
     if ($gpu.cudaOk) {
-        ok "GPU NVIDIA + CUDA Runtime 12.x disponibles → variante CUDA"
+        Write-OK "GPU NVIDIA + CUDA Runtime 12.x disponibles → variante CUDA"
         $variant        = "cuda"
         $artifactSuffix = "windows-x86_64-cuda"
         $variantLabel   = "CUDA (GPU NVIDIA)"
