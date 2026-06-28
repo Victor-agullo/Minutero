@@ -1,40 +1,39 @@
 [package]
 name = "transcriptor"
-version = "0.2.0"
-edition = "2021"
+version = "0.3.0"
+edition = "2024"
 
 [dependencies]
 anyhow = "1.0.102"
-chrono = "0.4.44"
-cpal = "0.17.3"
-eframe = "0.33.3"
-egui = "0.33.3"
+chrono = "0.4.45"
+cpal = "0.18.1"
+eframe = "0.34.3"
+egui = "0.34.3"
 futures-util = "0.3.32"
+ndarray = "0.17.2"
 num-traits = "0.2.19"
-rubato = "1.0.1"
-reqwest = { version = "0.13.2", default-features = false, features = ["rustls", "stream"] }
-rfd = "0.17.*"
-tokio = { version = "1.50.0", features = ["full"] }
+ort = { version = "2.0.0-rc.12", default-features = true }
+rubato = "3.0.0"
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls", "stream"] }
+rfd = "0.17.2"
+rustfft = "6.4.1"
+tokio = { version = "1.52.3", features = ["full"] }
 whisper-rs = { version = "0.16.0" }
+sysinfo = { version = "0.39", default-features = false, features = ["system"] }
 
 [features]
 # ── Aceleración por GPU ────────────────────────────────────────────────────
-# NVIDIA — Linux y Windows
-cuda      = ["whisper-rs/cuda"]
+# NVIDIA — Linux y Windows (Whisper + Diarización)
+cuda      = ["whisper-rs/cuda", "ort/cuda"]
 
-# AMD — Linux (ROCm/HIP). Requiere ROCm SDK instalado.
+# AMD — Linux (ROCm/HIP). Diarización usa CPU (ort no soporta ROCm).
 rocm      = ["whisper-rs/hipblas"]
 
-# Intel — Linux (oneAPI SYCL). Requiere Intel oneAPI Base Toolkit.
+# Intel — Linux (oneAPI SYCL). Diarización usa CPU.
 intel     = ["whisper-rs/intel-sycl"]
 
 # Apple Silicon — macOS (Metal + Neural Engine via CoreML)
-metal     = ["whisper-rs/metal", "whisper-rs/coreml"]
+metal     = ["whisper-rs/metal", "whisper-rs/coreml", "ort/coreml"]
 
-# Windows AMD + Intel — DirectML (Windows 10/11, sin drivers extra).
-# No es un feature de whisper-rs; se activa via CMAKE_ARGS en el workflow.
-# Este feature sirve como marcador para el instalador.
-directml  = []
-
-[target.'cfg(target_os = "linux")'.dependencies]
-libc = "0.2.183"
+# Windows AMD + Intel — DirectML (Whisper via CMAKE_ARGS, Diarización via ort)
+directml  = ["ort/directml"]

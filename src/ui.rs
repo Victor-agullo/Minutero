@@ -8,8 +8,9 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use chrono::Local;
 use crate::data::{
-    AudioMessage, DeviceInfo, InterlocutorProfile, LanguageConfig,
-    SourceType, View, VideoMessage, SOURCE_LANGUAGES,
+    AudioMessage, DeviceInfo, DiarizeConfig, DiarizeMode, InterlocutorProfile,
+    LanguageConfig, SourceType, SpeakerInfo, TimelineEntry, TranscriptSegment,
+    View, VideoMessage, SPEAKER_COLORS, SOURCE_LANGUAGES,
 };
 use crate::audio::{audio_thread_main, get_available_devices};
 use crate::video::video_transcription_thread;
@@ -38,14 +39,26 @@ pub struct TranscriptorApp {
     pub loopback_info: Option<LoopbackInfo>,
     pub show_loopback_setup: bool,
 
+    // ── Diarización ────────────────────────────────────────────────────────
+    pub diarize_config: DiarizeConfig,
+    /// Speakers detectados en tiempo real (para la pestaña Transcripción).
+    pub rt_speakers: Vec<SpeakerInfo>,
+
     // ── Transcripción de vídeo ─────────────────────────────────────────────
     pub video_file_path: Option<String>,
-    pub video_transcription: String,
+    pub video_segments: Vec<TranscriptSegment>,
     pub video_status: String,
     pub video_progress: f32,
     pub video_is_running: bool,
     pub video_rx: Option<Receiver<VideoMessage>>,
     pub video_stop_signal: Option<Arc<AtomicBool>>,
+    /// Speakers detectados en vídeo.
+    pub video_speakers: Vec<SpeakerInfo>,
+    /// Timeline de diarización para la visualización.
+    pub video_timeline: Vec<TimelineEntry>,
+    pub video_total_duration: f64,
+    /// Aviso de diarización (persiste aunque Whisper sobreescriba video_status).
+    pub video_diarize_warning: String,
 }
 
 impl Default for TranscriptorApp {
@@ -69,13 +82,19 @@ impl Default for TranscriptorApp {
             lang_config: LanguageConfig::default(),
             loopback_info: None,
             show_loopback_setup: false,
+            diarize_config: DiarizeConfig::default(),
+            rt_speakers: Vec::new(),
             video_file_path: None,
-            video_transcription: String::new(),
+            video_segments: Vec::new(),
             video_status: String::from("Selecciona un archivo de vídeo o audio."),
             video_progress: 0.0,
             video_is_running: false,
             video_rx: None,
             video_stop_signal: None,
+            video_speakers: Vec::new(),
+            video_timeline: Vec::new(),
+            video_total_duration: 0.0,
+            video_diarize_warning: String::new(),
         };
 
         if !app.all_input_devices.is_empty() {
@@ -90,49 +109,82 @@ impl Default for TranscriptorApp {
 }
 
 impl eframe::App for TranscriptorApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    // eframe 0.34: firma corregida — recibe &mut egui::Ui en lugar de &egui::Context.
+    fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         // ── Procesar mensajes de audio en tiempo real ──────────────────────
-        if let Some(rx) = &self.ui_rx {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    AudioMessage::Status(s) => self.status_message = s,
-                    AudioMessage::Transcription { text, name } => {
-                        if !text.trim().is_empty() {
-                            self.transcription.push_str(&format!("({}) {}\n", name, text));
-                        }
+        // Recopilar mensajes primero para evitar conflicto de borrows
+        let audio_msgs: Vec<AudioMessage> = self.ui_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+
+        for msg in audio_msgs {
+            match msg {
+                AudioMessage::Status(s) => self.status_message = s,
+                AudioMessage::Transcription { text, name, speaker_id } => {
+                    if !text.trim().is_empty() {
+                        let label = if let Some(sid) = speaker_id {
+                            self.ensure_rt_speaker(sid);
+                            let info = &self.rt_speakers[sid];
+                            format!("{}/{}", name, info.label)
+                        } else {
+                            name.clone()
+                        };
+                        self.transcription.push_str(&format!("({}) {}\n", label, text));
                     }
-                    AudioMessage::Error(e) => self.status_message = format!("❌ Error: {}", e),
                 }
+                AudioMessage::Error(e) => self.status_message = format!("❌ Error: {}", e),
             }
         }
 
         // ── Procesar mensajes de vídeo ─────────────────────────────────────
-        if let Some(rx) = &self.video_rx {
-            while let Ok(msg) = rx.try_recv() {
-                match msg {
-                    VideoMessage::Status(s) => self.video_status = s,
-                    VideoMessage::Progress(p) => self.video_progress = p,
-                    VideoMessage::Segment { timestamp, text } => {
-                        self.video_transcription
-                            .push_str(&format!("[{}] {}\n", timestamp, text));
+        let video_msgs: Vec<VideoMessage> = self.video_rx.as_ref()
+            .map(|rx| std::iter::from_fn(|| rx.try_recv().ok()).collect())
+            .unwrap_or_default();
+
+        for msg in video_msgs {
+            match msg {
+                VideoMessage::Status(s) => self.video_status = s,
+                VideoMessage::Progress(p) => self.video_progress = p,
+                VideoMessage::Segment { timestamp, time_secs, duration_secs, text, speaker_id } => {
+                    if let Some(sid) = speaker_id {
+                        self.ensure_video_speaker(sid);
                     }
-                    VideoMessage::Done => {
+                    self.video_segments.push(TranscriptSegment {
+                        timestamp,
+                        time_secs,
+                        duration_secs,
+                        text,
+                        speaker_id,
+                    });
+                }
+                VideoMessage::Timeline { entries, num_speakers, total_duration } => {
+                    self.video_timeline = entries;
+                    self.video_total_duration = total_duration;
+                    for i in 0..num_speakers {
+                        self.ensure_video_speaker(i);
+                    }
+                }
+                VideoMessage::Done => {
+                    if self.video_is_running {
                         self.video_is_running = false;
                         self.video_status = "✅ Transcripción completada.".into();
                         if let Err(e) = self.save_video_transcript() {
                             self.video_status = format!("❌ Error al guardar: {:?}", e);
                         }
                     }
-                    VideoMessage::Error(e) => {
-                        self.video_is_running = false;
-                        self.video_status = format!("❌ Error: {}", e);
-                    }
+                }
+                VideoMessage::Error(e) => {
+                    self.video_is_running = false;
+                    self.video_status = format!("❌ Error: {}", e);
+                }
+                VideoMessage::DiarizeWarning(w) => {
+                    self.video_diarize_warning = w;
                 }
             }
         }
 
-        // ── UI ─────────────────────────────────────────────────────────────
-        egui::TopBottomPanel::top("top_panel").show(ctx, |ui| {
+        // egui 0.34: Panel::top/central + show_inside(ui) en lugar de TopBottomPanel + show(ctx)
+        egui::Panel::top("top_panel").show_inside(ui, |ui| {
             ui.horizontal_wrapped(|ui| {
                 ui.selectable_value(&mut self.current_view, View::Transcription, "🎙 Transcripción");
                 ui.selectable_value(&mut self.current_view, View::Video, "🎬 Vídeo");
@@ -141,11 +193,14 @@ impl eframe::App for TranscriptorApp {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.add_space(10.0);
                     ui.label(format!("Modelo: ggml-{}.bin", self.model_name));
+                    if self.diarize_config.enabled {
+                        ui.colored_label(egui::Color32::from_rgb(66, 133, 244), "🔊 Diarización");
+                    }
                 });
             });
         });
 
-        egui::CentralPanel::default().show(ctx, |ui| {
+        egui::CentralPanel::default().show_inside(ui, |ui| {
             match self.current_view {
                 View::Transcription => self.transcriber_ui(ui),
                 View::Video => self.video_ui(ui),
@@ -154,14 +209,32 @@ impl eframe::App for TranscriptorApp {
         });
 
         if self.show_loopback_setup {
-            self.show_loopback_dialog(ctx);
+            self.show_loopback_dialog(ui.ctx());
         }
 
-        ctx.request_repaint();
+        ui.ctx().request_repaint();
     }
 }
 
 impl TranscriptorApp {
+    // ── Helpers de speakers ───────────────────────────────────────────────
+
+    fn ensure_rt_speaker(&mut self, id: usize) {
+        while self.rt_speakers.len() <= id {
+            self.rt_speakers.push(SpeakerInfo::new(self.rt_speakers.len()));
+        }
+    }
+
+    fn ensure_video_speaker(&mut self, id: usize) {
+        while self.video_speakers.len() <= id {
+            self.video_speakers.push(SpeakerInfo::new(self.video_speakers.len()));
+        }
+    }
+
+    fn speaker_color_egui(color: (u8, u8, u8)) -> egui::Color32 {
+        egui::Color32::from_rgb(color.0, color.1, color.2)
+    }
+
     // ── Pestaña: Transcripción en tiempo real ──────────────────────────────
 
     fn check_and_prompt_loopback(&mut self) {
@@ -193,9 +266,12 @@ impl TranscriptorApp {
         let model = self.model_name.clone();
         let n = active.len();
         let lang = self.lang_config.clone();
+        let diarize = self.diarize_config.clone();
+
+        self.rt_speakers.clear();
 
         thread::spawn(move || {
-            if let Err(e) = audio_thread_main(model, tx.clone(), stop, active, lang) {
+            if let Err(e) = audio_thread_main(model, tx.clone(), stop, active, lang, diarize) {
                 let _ = tx.send(AudioMessage::Error(format!("{:?}", e)));
             }
         });
@@ -213,10 +289,12 @@ impl TranscriptorApp {
             ui.label("Modelo Whisper:");
             egui::ComboBox::from_label("")
                 .selected_text(&self.model_name)
-                .width(150.0)
+                .width(180.0)
                 .show_ui(ui, |ui| {
-                    ui.selectable_value(&mut self.model_name, "medium".into(), "Medium");
-                    ui.selectable_value(&mut self.model_name, "large-v3".into(), "Large-v3");
+                    ui.selectable_value(&mut self.model_name, "small".into(),         "Small    (~150 MB, rápido)");
+                    ui.selectable_value(&mut self.model_name, "medium".into(),        "Medium   (~450 MB)");
+                    ui.selectable_value(&mut self.model_name, "large-v3-turbo".into(),"Large-v3 Turbo (~800 MB, recomendado)");
+                    ui.selectable_value(&mut self.model_name, "large-v3".into(),      "Large-v3 (~1.5 GB, máx. calidad)");
                 });
         });
 
@@ -234,8 +312,7 @@ impl TranscriptorApp {
                 match self.save_transcript() {
                     Ok(path) => {
                         self.status_message = format!(
-                            "✅ Captura detenida. Minuta guardada en: {}",
-                            path.display()
+                            "✅ Captura detenida. Minuta guardada en: {}", path.display()
                         );
                     }
                     Err(e) => {
@@ -261,6 +338,18 @@ impl TranscriptorApp {
             );
         });
 
+        // Speaker legend (real-time)
+        if !self.rt_speakers.is_empty() {
+            ui.add_space(4.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label("Hablantes:");
+                for sp in &self.rt_speakers {
+                    let color = Self::speaker_color_egui(sp.color);
+                    ui.colored_label(color, format!("● {}", sp.label));
+                }
+            });
+        }
+
         ui.add_space(10.0);
         ui.label("📝 Minuta (Interlocutor) Texto:");
 
@@ -278,6 +367,7 @@ impl TranscriptorApp {
 
         if ui.button("🗑️ Limpiar").clicked() {
             self.transcription.clear();
+            self.rt_speakers.clear();
         }
     }
 
@@ -292,15 +382,19 @@ impl TranscriptorApp {
             ui.add_enabled_ui(!self.video_is_running, |ui| {
                 if ui.button("📂 Seleccionar archivo").clicked() {
                     if let Some(path) = rfd::FileDialog::new()
-                        .add_filter(
-                            "Vídeo / Audio",
-                            &["mp4", "mkv", "avi", "mov", "webm", "mp3", "wav", "flac", "ogg", "m4a"],
-                        )
+                        // Filtros separados: en Linux/GTK un único grupo con muchas
+                        // extensiones a veces no muestra todos los archivos correctamente.
+                        .add_filter("Vídeo",  &["mp4", "mkv", "avi", "mov", "webm", "m4v", "ts", "wmv"])
+                        .add_filter("Audio",  &["mp3", "wav", "flac", "ogg", "m4a", "aac", "opus", "wma", "aiff"])
+                        .add_filter("Todos los archivos", &["*"])
                         .pick_file()
                     {
                         self.video_file_path = Some(path.to_string_lossy().to_string());
-                        self.video_transcription.clear();
+                        self.video_segments.clear();
+                        self.video_speakers.clear();
+                        self.video_timeline.clear();
                         self.video_progress = 0.0;
+                        self.video_total_duration = 0.0;
                         self.video_status = "Archivo seleccionado. Listo para transcribir.".into();
                     }
                 }
@@ -308,7 +402,6 @@ impl TranscriptorApp {
 
             match &self.video_file_path {
                 Some(p) => {
-                    // Mostrar solo el nombre del archivo, no la ruta completa
                     let name = Path::new(p)
                         .file_name()
                         .map(|n| n.to_string_lossy().to_string())
@@ -327,10 +420,12 @@ impl TranscriptorApp {
             ui.add_enabled_ui(!self.video_is_running, |ui| {
                 egui::ComboBox::from_id_salt("video_model")
                     .selected_text(&self.model_name)
-                    .width(150.0)
+                    .width(180.0)
                     .show_ui(ui, |ui| {
-                        ui.selectable_value(&mut self.model_name, "medium".into(), "Medium");
-                        ui.selectable_value(&mut self.model_name, "large-v3".into(), "Large-v3");
+                        ui.selectable_value(&mut self.model_name, "small".into(),         "Small    (~150 MB, rápido)");
+                        ui.selectable_value(&mut self.model_name, "medium".into(),        "Medium   (~450 MB)");
+                        ui.selectable_value(&mut self.model_name, "large-v3-turbo".into(),"Large-v3 Turbo (~800 MB, recomendado)");
+                        ui.selectable_value(&mut self.model_name, "large-v3".into(),      "Large-v3 (~1.5 GB, máx. calidad)");
                     });
             });
 
@@ -343,6 +438,10 @@ impl TranscriptorApp {
                     if let Some(sig) = self.video_stop_signal.take() {
                         sig.store(true, Ordering::SeqCst);
                     }
+                    // Actualizar estado inmediatamente en la UI, sin esperar al hilo
+                    self.video_is_running = false;
+                    self.video_progress = 0.0;
+                    self.video_status = "⛔ Cancelado por el usuario.".into();
                 }
             } else if ui.add_enabled(can_start, egui::Button::new("▶ Transcribir")).clicked() {
                 self.start_video_transcription();
@@ -359,6 +458,12 @@ impl TranscriptorApp {
             ui.add(bar);
         }
 
+        // ── Timeline de diarización ───────────────────────────────────────
+        if !self.video_timeline.is_empty() {
+            ui.add_space(4.0);
+            self.draw_speaker_timeline(ui);
+        }
+
         // Estado
         ui.horizontal(|ui| {
             ui.label("Estado:");
@@ -368,29 +473,73 @@ impl TranscriptorApp {
             );
         });
 
+        // Estado de diarización (persiste aunque Whisper sobreescriba el status principal)
+        if !self.video_diarize_warning.is_empty() {
+            let color = if self.video_diarize_warning.starts_with('✅') {
+                egui::Color32::from_rgb(52, 168, 83)  // verde
+            } else {
+                egui::Color32::YELLOW
+            };
+            ui.colored_label(color, &self.video_diarize_warning);
+        }
+
+        // ── Speaker labels editables ──────────────────────────────────────
+        if !self.video_speakers.is_empty() && !self.video_is_running {
+            ui.add_space(6.0);
+            ui.horizontal_wrapped(|ui| {
+                ui.label(egui::RichText::new("Hablantes:").strong());
+                for sp in self.video_speakers.iter_mut() {
+                    let color = Self::speaker_color_egui(sp.color);
+                    ui.colored_label(color, "●");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut sp.label)
+                            .desired_width(100.0)
+                            .hint_text(format!("Speaker {}", sp.id + 1)),
+                    );
+                    ui.add_space(8.0);
+                }
+            });
+        }
+
         ui.separator();
 
         // Transcripción
-        ui.label("📝 Transcripción [HH:MM:SS] texto:");
+        ui.label("📝 Transcripción [HH:MM:SS] (Speaker) texto:");
 
         egui::ScrollArea::vertical()
-            .max_height(380.0)
+            .max_height(320.0)
             .stick_to_bottom(true)
             .show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.video_transcription)
-                        .desired_width(f32::INFINITY)
-                        .font(egui::TextStyle::Monospace)
-                        .interactive(!self.video_is_running),
-                );
+                for seg in &self.video_segments {
+                    ui.horizontal_wrapped(|ui| {
+                        ui.label(
+                            egui::RichText::new(format!("[{}]", seg.timestamp))
+                                .monospace()
+                                .color(egui::Color32::GRAY),
+                        );
+
+                        if let Some(sid) = seg.speaker_id {
+                            if sid < self.video_speakers.len() {
+                                let sp = &self.video_speakers[sid];
+                                let color = Self::speaker_color_egui(sp.color);
+                                ui.colored_label(color, format!("({})", sp.label));
+                            }
+                        }
+
+                        ui.label(&seg.text);
+                    });
+                }
             });
 
         ui.horizontal(|ui| {
             if ui.button("🗑️ Limpiar").clicked() {
-                self.video_transcription.clear();
+                self.video_segments.clear();
+                self.video_speakers.clear();
+                self.video_timeline.clear();
                 self.video_progress = 0.0;
+                self.video_total_duration = 0.0;
             }
-            if !self.video_transcription.is_empty() && !self.video_is_running {
+            if !self.video_segments.is_empty() && !self.video_is_running {
                 if ui.button("💾 Guardar").clicked() {
                     match self.save_video_transcript() {
                         Ok(p) => self.video_status = format!("✅ Guardado en: {}", p.display()),
@@ -399,6 +548,49 @@ impl TranscriptorApp {
                 }
             }
         });
+    }
+
+    /// Dibuja la timeline visual de diarización (barra horizontal con colores por speaker).
+    fn draw_speaker_timeline(&self, ui: &mut egui::Ui) {
+        let available_width = ui.available_width();
+        let height = 22.0;
+
+        let (rect, _response) = ui.allocate_exact_size(
+            egui::vec2(available_width, height),
+            egui::Sense::hover(),
+        );
+
+        if self.video_total_duration <= 0.0 { return; }
+
+        let painter = ui.painter_at(rect);
+
+        // Fondo
+        painter.rect_filled(rect, 3.0, egui::Color32::from_gray(50));
+
+        // Segmentos coloreados por speaker
+        for entry in &self.video_timeline {
+            let x_start = rect.left()
+                + (entry.start_secs / self.video_total_duration) as f32 * rect.width();
+            let x_end = rect.left()
+                + (entry.end_secs / self.video_total_duration) as f32 * rect.width();
+
+            let color = if entry.speaker_id < self.video_speakers.len() {
+                let c = self.video_speakers[entry.speaker_id].color;
+                egui::Color32::from_rgba_premultiplied(c.0, c.1, c.2, 200)
+            } else {
+                let c = SPEAKER_COLORS[entry.speaker_id % SPEAKER_COLORS.len()];
+                egui::Color32::from_rgba_premultiplied(c.0, c.1, c.2, 200)
+            };
+
+            let seg_rect = egui::Rect::from_min_max(
+                egui::pos2(x_start, rect.top() + 1.0),
+                egui::pos2(x_end, rect.bottom() - 1.0),
+            );
+            painter.rect_filled(seg_rect, 1.0, color);
+        }
+
+        // Borde
+        painter.rect_stroke(rect, 3.0, egui::Stroke::new(1.0, egui::Color32::from_gray(80)), egui::StrokeKind::Outside);
     }
 
     fn start_video_transcription(&mut self) {
@@ -415,21 +607,26 @@ impl TranscriptorApp {
 
         let model = self.model_name.clone();
         let lang = self.lang_config.clone();
+        let diarize = self.diarize_config.clone();
 
         thread::spawn(move || {
-            if let Err(e) = video_transcription_thread(file_path, model, lang, tx.clone(), stop) {
+            if let Err(e) = video_transcription_thread(file_path, model, lang, diarize, tx.clone(), stop) {
                 let _ = tx.send(VideoMessage::Error(format!("{:?}", e)));
             }
         });
 
         self.video_is_running = true;
-        self.video_transcription.clear();
+        self.video_segments.clear();
+        self.video_speakers.clear();
+        self.video_timeline.clear();
         self.video_progress = 0.0;
+        self.video_total_duration = 0.0;
+        self.video_diarize_warning.clear();
         self.video_status = "Iniciando...".into();
     }
 
     fn save_video_transcript(&self) -> Result<PathBuf> {
-        if self.video_transcription.trim().is_empty() {
+        if self.video_segments.is_empty() {
             return Err(anyhow!("No hay transcripción para guardar."));
         }
 
@@ -445,12 +642,30 @@ impl TranscriptorApp {
 
         std::fs::create_dir_all(&self.output_dir)?;
 
-        let content = format!(
-            "# Transcripción: {}\n\nFecha: {}\n\n---\n\n{}",
+        let mut content = format!(
+            "# Transcripción: {}\n\nFecha: {}\n",
             stem,
             Local::now().format("%d-%m-%Y %H:%M:%S"),
-            self.video_transcription
         );
+
+        // Leyenda de speakers
+        if !self.video_speakers.is_empty() {
+            content.push_str("\n## Hablantes\n\n");
+            for sp in &self.video_speakers {
+                content.push_str(&format!("- **{}** (Speaker {})\n", sp.label, sp.id + 1));
+            }
+        }
+
+        content.push_str("\n---\n\n");
+
+        for seg in &self.video_segments {
+            let speaker_label = seg.speaker_id
+                .and_then(|sid| self.video_speakers.get(sid))
+                .map(|sp| format!(" ({})", sp.label))
+                .unwrap_or_default();
+
+            content.push_str(&format!("[{}]{} {}\n", seg.timestamp, speaker_label, seg.text));
+        }
 
         std::fs::write(&output_path, content)?;
         Ok(output_path)
@@ -462,7 +677,7 @@ impl TranscriptorApp {
         ui.heading("⚙️ Configuración de Interlocutores y Audio");
         ui.separator();
 
-        // Idioma
+        // ── Idioma ────────────────────────────────────────────────────────
         ui.label(egui::RichText::new("🌐 Idioma").strong());
         ui.add_space(4.0);
 
@@ -499,18 +714,78 @@ impl TranscriptorApp {
             });
 
             ui.label(
-                egui::RichText::new(
-                    "ℹ Whisper solo puede traducir al inglés de forma nativa.",
-                )
-                .small()
-                .color(egui::Color32::GRAY),
+                egui::RichText::new("ℹ Whisper solo puede traducir al inglés de forma nativa.")
+                    .small()
+                    .color(egui::Color32::GRAY),
             );
         });
 
         ui.add_space(10.0);
         ui.separator();
 
-        // Loopback
+        // ── Diarización ───────────────────────────────────────────────────
+        ui.label(egui::RichText::new("🔊 Diarización de Hablantes").strong());
+        ui.add_space(4.0);
+
+        ui.add_enabled_ui(!self.is_running && !self.video_is_running, |ui| {
+            ui.checkbox(&mut self.diarize_config.enabled, "Activar diferenciación de voces");
+
+            if self.diarize_config.enabled {
+                ui.add_space(4.0);
+                ui.horizontal(|ui| {
+                    ui.label("Modo:");
+                    ui.radio_value(&mut self.diarize_config.mode, DiarizeMode::Auto, "Auto-detección");
+                    ui.radio_value(&mut self.diarize_config.mode, DiarizeMode::Manual, "Nº manual");
+                });
+
+                match self.diarize_config.mode {
+                    DiarizeMode::Auto => {
+                        ui.horizontal(|ui| {
+                            ui.label("Sensibilidad:");
+                            ui.add(
+                                egui::Slider::new(&mut self.diarize_config.threshold, 0.50..=0.85)
+                                    .text("umbral coseno")
+                                    .step_by(0.05),
+                            );
+                        });
+                        ui.label(
+                            egui::RichText::new(
+                                "ℹ Más bajo = más speakers (más sensible a diferencias).\
+                                 Más alto = menos speakers (fusiona voces parecidas).\
+                                 Rango recomendado: 0.65–0.75."
+                            )
+                            .small()
+                            .color(egui::Color32::GRAY),
+                        );
+                    }
+                    DiarizeMode::Manual => {
+                        ui.horizontal(|ui| {
+                            ui.label("Nº de hablantes:");
+                            ui.add(
+                                egui::DragValue::new(&mut self.diarize_config.num_speakers)
+                                    .range(2..=10)
+                                    .speed(0.1),
+                            );
+                        });
+                    }
+                }
+
+                ui.add_space(4.0);
+                ui.label(
+                    egui::RichText::new(
+                        "Requiere el modelo ONNX de embeddings (~50 MB). Se descarga automáticamente\n\
+                         en la primera ejecución, o puedes colocarlo manualmente en models/speaker_embedding.onnx"
+                    )
+                    .small()
+                    .color(egui::Color32::GRAY),
+                );
+            }
+        });
+
+        ui.add_space(10.0);
+        ui.separator();
+
+        // ── Loopback ──────────────────────────────────────────────────────
         ui.horizontal(|ui| {
             if ui.button("📊 Configurar Captura de Salida").clicked() {
                 self.loopback_info = check_loopback_status().ok();
@@ -526,7 +801,7 @@ impl TranscriptorApp {
 
         ui.add_space(10.0);
 
-        // Interlocutores
+        // ── Interlocutores ────────────────────────────────────────────────
         ui.add_enabled_ui(!self.is_running, |ui| {
             ui.label("Añadir nueva fuente de audio:");
             ui.horizontal(|ui| {
@@ -716,14 +991,23 @@ impl TranscriptorApp {
             .join("_");
         let output_path = Path::new(&self.output_dir).join(format!("{}_{}.md", names, timestamp));
         std::fs::create_dir_all(&self.output_dir)?;
-        std::fs::write(
-            &output_path,
-            format!(
-                "# Minuta de Transcripción\n\nFecha: {}\n\n---\n\n{}",
-                Local::now().format("%d-%m-%Y %H:%M:%S"),
-                self.transcription
-            ),
-        )?;
+
+        let mut content = format!(
+            "# Minuta de Transcripción\n\nFecha: {}\n",
+            Local::now().format("%d-%m-%Y %H:%M:%S"),
+        );
+
+        // Leyenda de speakers (real-time)
+        if !self.rt_speakers.is_empty() {
+            content.push_str("\n## Hablantes detectados\n\n");
+            for sp in &self.rt_speakers {
+                content.push_str(&format!("- **{}**\n", sp.label));
+            }
+        }
+
+        content.push_str(&format!("\n---\n\n{}", self.transcription));
+
+        std::fs::write(&output_path, content)?;
         Ok(output_path)
     }
 
